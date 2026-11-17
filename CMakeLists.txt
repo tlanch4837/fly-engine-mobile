@@ -67,23 +67,30 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "iOS")
     set(FLY_BUNDLE_ID "com.ovoa.flybasic" CACHE STRING "Bundle identifier")
     set(FLY_BUILD_NUMBER "1" CACHE STRING "CFBundleVersion: must rise with every TestFlight upload (Codemagic passes BUILD_NUMBER)")
 
-    # Metal shaders: one .air per .metal, linked into default.metallib (as in cityengine-ios)
+    # Metal shaders: one .air per .metal, linked into default.metallib (as in cityengine-ios). FLY_OFFLINE_METAL=OFF skips that
+    # (no Metal toolchain on the build machine): the renderer then compiles the bundled msl/*.metal at run time, a slower start.
+    option(FLY_OFFLINE_METAL "Compile the Metal shaders into default.metallib at build time" ON)
     file(GLOB FLY_MSL "${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/msl/*.metal")
-    set(FLY_SHADER_DIR "${CMAKE_CURRENT_BINARY_DIR}/shaders/${FLY_METAL_SDK}-${CMAKE_OSX_DEPLOYMENT_TARGET}")
-    set(FLY_AIR)
-    foreach(msl IN LISTS FLY_MSL)
-        get_filename_component(stem "${msl}" NAME_WE)
-        set(air "${FLY_SHADER_DIR}/${stem}.air")
-        add_custom_command(OUTPUT "${air}"
-            COMMAND "${CMAKE_COMMAND}" -E make_directory "${FLY_SHADER_DIR}"
-            COMMAND xcrun --sdk "${FLY_METAL_SDK}" metal -std=metal3.0 -target "${FLY_METAL_TARGET}" -c "${msl}" -o "${air}"
-            DEPENDS "${msl}" VERBATIM)
-        list(APPEND FLY_AIR "${air}")
-    endforeach()
-    set(FLY_METALLIB "${FLY_SHADER_DIR}/default.metallib")
-    add_custom_command(OUTPUT "${FLY_METALLIB}" COMMAND xcrun --sdk "${FLY_METAL_SDK}" metallib ${FLY_AIR} -o "${FLY_METALLIB}"
-        DEPENDS ${FLY_AIR} VERBATIM)
-    set_source_files_properties("${FLY_METALLIB}" PROPERTIES GENERATED TRUE MACOSX_PACKAGE_LOCATION Resources)
+    if(FLY_OFFLINE_METAL)
+        set(FLY_SHADER_DIR "${CMAKE_CURRENT_BINARY_DIR}/shaders/${FLY_METAL_SDK}-${CMAKE_OSX_DEPLOYMENT_TARGET}")
+        set(FLY_AIR)
+        foreach(msl IN LISTS FLY_MSL)
+            get_filename_component(stem "${msl}" NAME_WE)
+            set(air "${FLY_SHADER_DIR}/${stem}.air")
+            add_custom_command(OUTPUT "${air}"
+                COMMAND "${CMAKE_COMMAND}" -E make_directory "${FLY_SHADER_DIR}"
+                COMMAND xcrun --sdk "${FLY_METAL_SDK}" metal -std=metal3.0 -target "${FLY_METAL_TARGET}" -c "${msl}" -o "${air}"
+                DEPENDS "${msl}" VERBATIM)
+            list(APPEND FLY_AIR "${air}")
+        endforeach()
+        set(FLY_METALLIB "${FLY_SHADER_DIR}/default.metallib")
+        add_custom_command(OUTPUT "${FLY_METALLIB}" COMMAND xcrun --sdk "${FLY_METAL_SDK}" metallib ${FLY_AIR} -o "${FLY_METALLIB}"
+            DEPENDS ${FLY_AIR} VERBATIM)
+        set_source_files_properties("${FLY_METALLIB}" PROPERTIES GENERATED TRUE MACOSX_PACKAGE_LOCATION Resources)
+    else()
+        set(FLY_METALLIB "")
+        message(STATUS "Metal: no offline metallib; the app compiles msl/*.metal at run time")
+    endif()
     set_source_files_properties(${FLY_MSL} PROPERTIES MACOSX_PACKAGE_LOCATION Resources/msl XCODE_EXPLICIT_FILE_TYPE text)
 
     # game data into the bundle's data/ folder: the baked airports, the Earth (places, land mask, coast) and the UI font
@@ -101,7 +108,7 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "iOS")
         src/platform/platform_ios.mm
         src/platform/apple/log_apple.cpp
         src/render/renderer_metal.mm
-        "${FLY_METALLIB}" ${FLY_MSL} ${FLY_DATA})
+        ${FLY_METALLIB} ${FLY_MSL} ${FLY_DATA})
     target_include_directories(fly_engine PRIVATE src third_party/metal-cpp)
     target_compile_definitions(fly_engine PRIVATE TBD_HAVE_METAL=1)
     set_source_files_properties(src/render/renderer_metal.mm PROPERTIES COMPILE_OPTIONS "-fno-objc-arc") # metal-cpp: manual refs

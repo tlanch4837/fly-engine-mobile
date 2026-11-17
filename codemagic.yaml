@@ -20,13 +20,16 @@ workflows:
       - name: CMake and the Metal toolchain
         script: |
           command -v cmake || brew install cmake
-          # Xcode 26 ships without the Metal shader compiler: fetch it unless this image already has it
-          xcrun --sdk iphoneos metal -v >/dev/null 2>&1 || xcodebuild -downloadComponent MetalToolchain
-          xcrun --sdk iphoneos metal -v
+          # Xcode 26 ships without the Metal shader compiler: fetch it unless this image already has it. If it still will not
+          # run (the download can mismatch the image's Xcode), build without the offline metallib: the app then compiles the
+          # bundled msl/*.metal at launch.
+          xcrun --sdk iphoneos metal -v >/dev/null 2>&1 || xcodebuild -downloadComponent MetalToolchain || true
+          if xcrun --sdk iphoneos metal -v; then echo "FLY_OFFLINE_METAL=ON" >> $CM_ENV
+          else echo "Metal toolchain unusable here: shaders compile on the device"; echo "FLY_OFFLINE_METAL=OFF" >> $CM_ENV; fi
       - name: Generate the Xcode project
         script: |
           cmake -S . -B build-ios -G Xcode \
-            -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_SYSROOT=iphoneos -DCMAKE_OSX_DEPLOYMENT_TARGET=16.0
+            -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_SYSROOT=iphoneos -DCMAKE_OSX_DEPLOYMENT_TARGET=16.0 -DFLY_OFFLINE_METAL=$FLY_OFFLINE_METAL
       - name: Build (Release, unsigned)
         script: |
           set -o pipefail
@@ -52,13 +55,16 @@ workflows:
       - name: CMake and the Metal toolchain
         script: |
           command -v cmake || brew install cmake
-          # Xcode 26 ships without the Metal shader compiler: fetch it unless this image already has it
-          xcrun --sdk iphoneos metal -v >/dev/null 2>&1 || xcodebuild -downloadComponent MetalToolchain
-          xcrun --sdk iphoneos metal -v
+          # Xcode 26 ships without the Metal shader compiler: fetch it unless this image already has it. If it still will not
+          # run (the download can mismatch the image's Xcode), build without the offline metallib: the app then compiles the
+          # bundled msl/*.metal at launch.
+          xcrun --sdk iphoneos metal -v >/dev/null 2>&1 || xcodebuild -downloadComponent MetalToolchain || true
+          if xcrun --sdk iphoneos metal -v; then echo "FLY_OFFLINE_METAL=ON" >> $CM_ENV
+          else echo "Metal toolchain unusable here: shaders compile on the device"; echo "FLY_OFFLINE_METAL=OFF" >> $CM_ENV; fi
       - name: Generate the Xcode project (signed with the team)
         script: |
           cmake -S . -B build-ios -G Xcode \
-            -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_SYSROOT=iphoneos -DCMAKE_OSX_DEPLOYMENT_TARGET=16.0 \
+            -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_SYSROOT=iphoneos -DCMAKE_OSX_DEPLOYMENT_TARGET=16.0 -DFLY_OFFLINE_METAL=$FLY_OFFLINE_METAL \
             -DFLY_TEAM_ID="$APPLE_TEAM_ID" -DFLY_BUNDLE_ID=com.ovoa.flybasic -DFLY_BUILD_NUMBER="$BUILD_NUMBER"
       - name: Signing profiles
         script: xcode-project use-profiles --project build-ios/FlyEngine.xcodeproj
