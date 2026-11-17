@@ -64,7 +64,9 @@
 - (void)resumeFrames {
     if (_link || _failed) return;
     _link = [CADisplayLink displayLinkWithTarget:self selector:@selector(frame:)];
-    _link.preferredFrameRateRange = CAFrameRateRangeMake(30, 60, 60); // ProMotion 120 later, behind a setting (battery, heat)
+    // up to ProMotion's 120 Hz (needs CADisableMinimumFrameDurationOnPhone in Info.plist): the HUD shows what the phone holds.
+    // A battery / heat setting can lower this later; the VR target is a steady 90.
+    _link.preferredFrameRateRange = CAFrameRateRangeMake(30, 120, 120);
     [_link addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
 }
 - (void)pauseFrames {

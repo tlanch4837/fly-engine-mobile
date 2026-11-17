@@ -1710,6 +1710,8 @@ private:
         timerFrames_ = 0;
         const uint64_t samples = gpuSamples_.exchange(0), micros = gpuMicros_.exchange(0);
         if (samples) Log("Metal: GPU frame %.2f ms at %ux%u (render %ux%u, %llu-frame mean)", (double)micros / 1000.0 / (double)samples, w_, h_, sceneW_, sceneH_, (unsigned long long)samples);
+        // the whole frame's mean in the first pass slot, so a HUD that sums GpuPasses() shows the real GPU time (not 0)
+        if (samples) { for (double& p : gpuPasses_) p = 0.0; gpuPasses_[0] = (double)micros / 1000.0 / (double)samples; }
         LogCounts("Metal");
     }
 
