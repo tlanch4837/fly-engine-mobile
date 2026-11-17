@@ -17,8 +17,12 @@ workflows:
       branch_patterns:
         - pattern: '*'
     scripts:
-      - name: CMake
-        script: command -v cmake || brew install cmake
+      - name: CMake and the Metal toolchain
+        script: |
+          command -v cmake || brew install cmake
+          # Xcode 26 ships without the Metal shader compiler: fetch it unless this image already has it
+          xcrun --sdk iphoneos metal -v >/dev/null 2>&1 || xcodebuild -downloadComponent MetalToolchain
+          xcrun --sdk iphoneos metal -v
       - name: Generate the Xcode project
         script: |
           cmake -S . -B build-ios -G Xcode \
@@ -45,8 +49,12 @@ workflows:
         distribution_type: app_store
         bundle_identifier: com.ovoa.flybasic
     scripts:
-      - name: CMake
-        script: command -v cmake || brew install cmake
+      - name: CMake and the Metal toolchain
+        script: |
+          command -v cmake || brew install cmake
+          # Xcode 26 ships without the Metal shader compiler: fetch it unless this image already has it
+          xcrun --sdk iphoneos metal -v >/dev/null 2>&1 || xcodebuild -downloadComponent MetalToolchain
+          xcrun --sdk iphoneos metal -v
       - name: Generate the Xcode project (signed with the team)
         script: |
           cmake -S . -B build-ios -G Xcode \
