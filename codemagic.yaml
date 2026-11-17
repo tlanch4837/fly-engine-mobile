@@ -34,9 +34,13 @@ workflows:
         script: |
           set -o pipefail
           cmake --build build-ios --config Release -- -sdk iphoneos CODE_SIGNING_ALLOWED=NO 2>&1 | tee build.log | tail -60
+      - name: Package an unsigned .ipa (for sideloading tools that sign it with your Apple ID)
+        script: |
+          rm -rf Payload && mkdir Payload && cp -R build-ios/Release-iphoneos/fly_engine.app Payload/
+          zip -qry fly_engine_unsigned.ipa Payload
     artifacts:
       - build.log
-      - build-ios/Release-iphoneos/*.app
+      - fly_engine_unsigned.ipa
 
   ios-testflight:
     name: iOS TestFlight
