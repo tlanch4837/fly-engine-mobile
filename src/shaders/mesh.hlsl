@@ -1,0 +1,2958 @@
+// One shader for everything: lit meshes (normal != 0) and flat-colored lines and 2D overlays (normal == 0).
+// Lighting, and the sun's shadow, are evaluated per pixel. Direct3D 12 compiles this at runtime (fxc, SM 5.1);
+// Vulkan gets SPIR-V from dxc at build time (-DVULKAN). Matrices arrive as 32 floats of push/root constants,
+// column-major, used as mul(M, v).
+
+struct PushConstants {
+    float4x4 mvp;
+    float4x4 model;
+#ifdef VULKAN
+    float4 material; // offset 128, fragment stage only: see MaterialConstants
+#endif
+};
+
+// The bound material's constants (Renderer::materialConstants_): x the skin detail scale (SetSkinDetailScale), y the pore depth (SetSkinPoreDepth), zw spare.
+#ifdef VULKAN
+[[vk::push_constant]] PushConstants pc;
+#define MATERIAL_CONSTANTS pc.material
+#else
+ConstantBuffer<PushConstants> pc : register(b0);
+struct MaterialConstants { float4 material; };
+ConstantBuffer<MaterialConstants> gMaterial : register(b3);
+#define MATERIAL_CONSTANTS gMaterial.material
+#endif
+// How many times skin's pore normal repeats across the atlas; 32 unless the material says otherwise.
+// How deep pores read (Renderer::SetSkinPoreDepth): 1 default, < 1 young and fine, > 1 old and coarse. 0 = never set = 1.
+float SkinPoreDepth() { return MATERIAL_CONSTANTS.y > 0.0 ? MATERIAL_CONSTANTS.y : 1.0; }
+float SkinDetailScale() { return MATERIAL_CONSTANTS.x > 0.0 ? MATERIAL_CONSTANTS.x : 32.0; } // pores ~0.4 mm (48: sub-pixel and averaged away; 20: too big)
+
+#include "lighting.hlsli"
+#include "city_shadow.hlsli"
+#include "building_atlas.hlsli"
+#include "world_atlas.hlsli"
+static float gPixelShadow = 1.0; // the sun's shadow at this pixel, set once by PSMain before any material runs
+
+// Motion vectors: what a moving thing's vertex shader needs to say where it was last frame.
+struct MotionData {
+    float4x4 viewProj;     // this frame, unjittered
+    float4x4 prevViewProj; // last frame, unjittered
+    float4 misc;           // x: seconds since last frame
+};
+#ifdef VULKAN
+[[vk::binding(6, 0)]] ConstantBuffer<MotionData> gMotion;
+#else
+ConstantBuffer<MotionData> gMotion : register(b2);
+#endif
+
+// Material textures: set 1 on Vulkan.
+#ifdef VULKAN
+[[vk::binding(0, 1)]] Texture2D<float4> gAlbedo;
+[[vk::binding(1, 1)]] Texture2D<float4> gNormalMap;
+[[vk::binding(2, 1)]] SamplerState gTexSampler;
+[[vk::binding(3, 1)]] Texture2D<float4> gSurface;
+[[vk::binding(4, 1)]] Texture2D<float4> gExtra; // R baked occlusion, B metalness scale, A emissive; see SetSurfaceExtra in renderer.h
+#else
+Texture2D<float4> gAlbedo : register(t1);
+Texture2D<float4> gNormalMap : register(t2);
+Texture2D<float4> gSurface : register(t3);
+Texture2D<float4> gExtra : register(t0, space1);
+SamplerState gTexSampler : register(s1);
+#endif
+
+// The project's pore texture as an atlas (gameenginetools/skin_tex/pore_atlas.py; alpha 0.5 marks it): four 1024 quadrants,
+// each a 1008 px tile inside an 8 px wrapped border. The extra map's G picks the tile per region: 1 (the default) general
+// face, 0.5 open pores (nose, inner cheeks), 0 thin eyelid skin; pore depth above 1 moves the general face to weathered.
+// `plain` is the ordinary sample, kept when the normal map is not the atlas (a skin with its own normal map).
+float3 SkinPoreQuadrant(float2 tiled, float2 q, float2 gx, float2 gy) {
+    const float2 at = (q * 1024.0 + 8.0 + frac(tiled) * 1008.0) / 2048.0;
+    return gNormalMap.SampleGrad(gTexSampler, at, gx, gy).xyz * 2.0 - 1.0;
+}
+float3 SkinPoreNormal(float2 uv, float2 tiled, float3 plain) {
+    if (abs(gNormalMap.SampleLevel(gTexSampler, float2(0.5, 0.5), 20.0).a - 0.5) > 0.1) return plain;
+    const float g = gExtra.Sample(gTexSampler, uv).g;
+    const float worn = saturate(SkinPoreDepth() - 1.0);
+    const float wThin = saturate(1.0 - g * 2.0), wOpen = saturate(1.0 - abs(g - 0.5) * 2.0), wFace = saturate(g * 2.0 - 1.0);
+    const float2 gx = ddx(tiled) * (1008.0 / 2048.0), gy = ddy(tiled) * (1008.0 / 2048.0);
+    float3 n = 0;
+    [branch] if (wFace * (1.0 - worn) > 0.01) n += wFace * (1.0 - worn) * SkinPoreQuadrant(tiled, float2(0, 0), gx, gy);
+    [branch] if (wFace * worn > 0.01) n += wFace * worn * SkinPoreQuadrant(tiled, float2(1, 1), gx, gy);
+    [branch] if (wOpen > 0.01) n += wOpen * SkinPoreQuadrant(tiled, float2(1, 0), gx, gy);
+    [branch] if (wThin > 0.01) n += wThin * SkinPoreQuadrant(tiled, float2(0, 1), gx, gy);
+    return normalize(n + float3(0, 0, 1e-4));
+}
+
+struct VSIn {
+    float3 pos : POSITION;
+    float3 normal : NORMAL;
+    float4 color : COLOR;
+    float2 uv : TEXCOORD1; // unused until materials sample textures
+};
+
+struct VSOut {
+    float4 pos : SV_Position;
+    float4 color : COLOR;
+    float3 normal : NORMAL;      // world space, not normalized; zero means unlit
+    float3 shadowPos : TEXCOORD0; // shadow map clip space (orthographic, so it interpolates linearly)
+    float3 worldPos : TEXCOORD2;
+    float2 uv : TEXCOORD3;
+    float3 tightPos : TEXCOORD4; // tight character shadow map clip space (orthographic too)
+    float3 origin : TEXCOORD7;   // the object's origin in the world: where its ground is, and a seed so repeats differ
+};
+
+// One instance of an instanced draw: a float3x4 model matrix, row by row, from the second vertex stream.
+struct InstanceIn {
+    float4 row0 : INSTROW0;
+    float4 row1 : INSTROW1;
+    float4 row2 : INSTROW2;
+};
+
+// Everything but the clip position, from the world position and the model's three axes (its 3x3's columns).
+VSOut ShadeVertex(VSIn v, float4 clip, float3 world, float3 c0, float3 c1, float3 c2) {
+    VSOut o;
+    o.pos = clip;
+    o.color = v.color;
+    o.uv = v.uv;
+    o.worldPos = world;
+    o.normal = float3(0, 0, 0);
+    o.shadowPos = float3(0, 0, 0);
+    o.tightPos = float3(0, 0, 0);
+    o.origin = world;
+
+    if (dot(v.normal, v.normal) > 1e-6) {
+        // Normal matrix without an inverse: the cofactor of the model's 3x3 stays correct under non-uniform scale.
+        float3 n = normalize(cross(c1, c2) * v.normal.x + cross(c2, c0) * v.normal.y + cross(c0, c1) * v.normal.z);
+        o.normal = n;
+
+        // Normal-offset the lookup (more at grazing angles) so surfaces don't shadow themselves.
+        float grazing = 1.0 - saturate(dot(n, gLight.sunDir.xyz));
+        o.shadowPos = mul(gLight.shadowVP, float4(world + n * (gLight.shadowParams.z * (1.0 + 2.0 * grazing)), 1.0)).xyz;
+        o.tightPos = mul(gLight.tightVP, float4(world + n * (gLight.tightParams.z * (1.0 + 2.0 * grazing)), 1.0)).xyz;
+    }
+    return o;
+}
+
+VSOut VSMain(VSIn v) {
+    VSOut o = ShadeVertex(v, mul(pc.mvp, float4(v.pos, 1.0)), mul(pc.model, float4(v.pos, 1.0)).xyz,
+                          float3(pc.model[0][0], pc.model[1][0], pc.model[2][0]),
+                          float3(pc.model[0][1], pc.model[1][1], pc.model[2][1]),
+                          float3(pc.model[0][2], pc.model[1][2], pc.model[2][2]));
+    o.origin = float3(pc.model[0][3], pc.model[1][3], pc.model[2][3]);
+    return o;
+}
+
+float3 InstanceWorld(VSIn v, InstanceIn inst) {
+    const float4 p = float4(v.pos, 1.0);
+    return float3(dot(inst.row0, p), dot(inst.row1, p), dot(inst.row2, p));
+}
+
+// Instanced draws: pc.mvp holds the view-projection alone.
+// Short-range instanced assets (grass) carry their draw distance in the vertex alpha: 0.3 + meters / 1000, set when the
+// asset is uploaded. Such an instance shrinks to its base over the last half of that distance, so the field thins out
+// instead of ending in a line. Everything else keeps its alpha's other meanings.
+VSOut VSInstanced(VSIn v, InstanceIn inst) {
+    float3 world = InstanceWorld(v, inst);
+    if (v.color.a > 0.29 && v.color.a < 0.39) {
+        const float reach = (v.color.a - 0.3) * 1000.0;
+        const float3 root = float3(inst.row0.w, inst.row1.w, inst.row2.w);
+        const float t = saturate((reach - length(root - gLight.eye.xyz)) / (reach * 0.5));
+        const float shrink = t * t * (3.0 - 2.0 * t);
+        world = root + (world - root) * shrink;
+    }
+    VSOut o = ShadeVertex(v, mul(pc.mvp, float4(world, 1.0)), world, float3(inst.row0.x, inst.row1.x, inst.row2.x),
+                          float3(inst.row0.y, inst.row1.y, inst.row2.y), float3(inst.row0.z, inst.row1.z, inst.row2.z));
+    o.origin = float3(inst.row0.w, inst.row1.w, inst.row2.w);
+    return o;
+}
+
+// GPU-placed vegetation (see vegetation.hlsl). pc.model holds parameters, not a matrix: row 0 is
+// (reach in meters, time in seconds, wind x, wind z), rows 1-3 are characters (xyz, radius).
+// Flags ride in the unused y of the character rows: [1][1] camera tilt, [2][1] ecotope strength, [3][1] animated.
+float VegetationNoise(float2 p) {
+    const float2 c = floor(p);
+    float2 f = p - c;
+    f = f * f * (3.0 - 2.0 * f);
+    const float a = frac(sin(dot(c, float2(127.1, 311.7))) * 43758.5453), b = frac(sin(dot(c + float2(1, 0), float2(127.1, 311.7))) * 43758.5453);
+    const float d = frac(sin(dot(c + float2(0, 1), float2(127.1, 311.7))) * 43758.5453), e = frac(sin(dot(c + float2(1, 1), float2(127.1, 311.7))) * 43758.5453);
+    return lerp(lerp(a, b, f.x), lerp(d, e, f.x), f.y);
+}
+// A ramp picked by world position, so a stretch of land has one character of plant: dry straw, ochre, sage, rust. A small
+// procedural stand-in for Decima's ecotope ramp array; it tints and does not re-author the albedos.
+float3 VegetationEcotope(float2 root) {
+    const float n = VegetationNoise(root / 53.0) * 0.7 + VegetationNoise(root / 9.0) * 0.3;
+    const float3 straw = float3(1.12, 1.02, 0.78), ochre = float3(1.15, 0.92, 0.66), sage = float3(0.86, 0.98, 0.80), rust = float3(1.12, 0.82, 0.66);
+    const float3 a = lerp(sage, straw, smoothstep(0.25, 0.45, n));
+    return lerp(a, lerp(ochre, rust, smoothstep(0.65, 0.8, n)), smoothstep(0.5, 0.65, n));
+}
+float3 VegetationWorld(VSIn v, InstanceIn inst, float time, bool camera) {
+    float3 world = InstanceWorld(v, inst);
+    const float reach = pc.model[0][0];
+    const float3 root = float3(inst.row0.w, inst.row1.w, inst.row2.w);
+    const float away = length(root - gLight.eye.xyz);
+    const float t = saturate((reach - away) / (reach * 0.35));
+    world = root + (world - root) * (t * t * (3.0 - 2.0 * t)); // thins toward the reach instead of ending in a line
+
+    // Everything below moves more the higher it is above the plant's root, so roots stay planted. Grows gently with height: a
+    // tuft's tip and a shrub's crown both move a believable amount.
+    const float h = max(world.y - root.y, 0.0);
+    const float weight = h * h / (h + 2.0);
+
+    // Camera tilt, after Sanders, GDC 2018: looking down, plants lean along the view, so the gaps between tufts close up.
+    if (camera && pc.model[1][1] > 0.0) {
+        const float3 view = normalize(root - gLight.eye.xyz);
+        world.xz += view.xz * min(h, 1.5) * saturate(view.y * -1.5) * pc.model[1][1];
+    }
+    if (pc.model[3][1] < 0.5) return world; // the far set does not animate
+
+    // Wind: gusts travel across the land along the wind, a quicker flutter differs per plant and per height.
+    const float2 wind = float2(pc.model[0][2], pc.model[0][3]);
+    const float along = dot(root.xz, wind);
+    const float gust = 0.55 + 0.45 * sin(along * 0.11 - time * 1.3) * sin(along * 0.037 + root.x * 0.02 - time * 0.47);
+    const float flutter = sin(time * 3.1 + root.x * 1.7 + root.z * 2.3 + h * 2.0) * 0.35;
+    world.xz += wind * (gust + flutter * gust) * 0.22 * weight * saturate(1.5 - away / 35.0);
+
+    // Characters: a plant leans away from each, and dips, more the closer its root is.
+    for (int c = 1; c < 4; ++c) {
+        const float radius = pc.model[c][3];
+        if (radius <= 0.0) continue;
+        const float2 from = root.xz - float2(pc.model[c][0], pc.model[c][2]);
+        const float d = length(from);
+        const float push = saturate(1.0 - d / radius);
+        const float bend = push * push * (3.0 - 2.0 * push);
+        const float2 dir = d > 1e-3 ? from / d : float2(1.0, 0.0);
+        world.xz += dir * bend * min(h, 1.6) * 0.85;
+        world.y -= bend * h * 0.45;
+    }
+    return world;
+}
+struct VSOutMotion {
+    VSOut base;
+    float4 curClip : TEXCOORD5;
+    float4 prevClip : TEXCOORD6;
+};
+VSOutMotion VSVegetation(VSIn v, InstanceIn inst) {
+    const float time = pc.model[0][1];
+    const float3 world = VegetationWorld(v, inst, time, true);
+    VSOutMotion o;
+    o.base = ShadeVertex(v, mul(pc.mvp, float4(world, 1.0)), world, float3(inst.row0.x, inst.row1.x, inst.row2.x),
+                         float3(inst.row0.y, inst.row1.y, inst.row2.y), float3(inst.row0.z, inst.row1.z, inst.row2.z));
+    o.base.origin = float3(inst.row0.w, inst.row1.w - 10.0, inst.row2.w); // seeds Weather by plant or stone; well below, so no dirt foot darkens all of something this small
+    o.curClip = mul(gMotion.viewProj, float4(world, 1.0));
+    o.prevClip = mul(gMotion.prevViewProj, float4(VegetationWorld(v, inst, time - gMotion.misc.x, true), 1.0));
+    if (pc.model[2][1] > 0.0)
+        o.base.color.rgb *= lerp(float3(1, 1, 1), VegetationEcotope(float2(inst.row0.w, inst.row2.w)), pc.model[2][1]);
+    o.base.color.a += 2.0; // PSMain: foliage
+    return o;
+}
+float4 ShadowVegetationVS(VSIn v, InstanceIn inst) : SV_Position {
+    float3 world = VegetationWorld(v, inst, pc.model[0][1], false);
+    // Shrinks to its root before the layer's shadow distance (Params, row 1), so shadows thin out instead of popping off.
+    const float reach = pc.model[1][1];
+    if (reach > 0.0) {
+        const float3 root = float3(inst.row0.w, inst.row1.w, inst.row2.w);
+        const float t = saturate((reach - length(root - gLight.eye.xyz)) / (reach * 0.35));
+        world = root + (world - root) * (t * t * (3.0 - 2.0 * t));
+    }
+    return mul(pc.mvp, float4(world, 1.0));
+}
+// Two-pass foliage, after the talks the Decima reference cites: alpha test in a cheap depth-only pass, then shade only what survived.
+struct VSOutDepth {
+    float4 pos : SV_Position;
+    float2 uv : TEXCOORD3;
+};
+VSOutDepth VSVegetationDepth(VSIn v, InstanceIn inst) {
+    VSOutDepth o;
+    o.pos = mul(pc.mvp, float4(VegetationWorld(v, inst, pc.model[0][1], true), 1.0));
+    o.uv = v.uv;
+    return o;
+}
+// CPU-skinned meshes: last frame's vertices are the other per-frame copy, read as a second stream.
+VSOutMotion VSSkinnedMotion(VSIn v, float3 prevPos : PREVPOS) {
+    VSOutMotion o;
+    o.base = VSMain(v);
+    o.curClip = mul(gMotion.viewProj, float4(o.base.worldPos, 1.0));
+    o.prevClip = mul(gMotion.prevViewProj, float4(mul(pc.model, float4(prevPos, 1.0)).xyz, 1.0));
+    return o;
+}
+
+float TileHash(float2 p) {
+    p = frac(p * float2(0.1031, 0.1030));
+    p += dot(p, p.yx + 33.33);
+    return frac((p.x + p.y) * p.x);
+}
+float TileNoise(float2 p) {
+    float2 c = floor(p), f = p - c;
+    f = f * f * (3.0 - 2.0 * f);
+    return lerp(lerp(TileHash(c), TileHash(c + float2(1, 0)), f.x), lerp(TileHash(c + float2(0, 1)), TileHash(c + float2(1, 1)), f.x), f.y);
+}
+// One tile without visible repeats: hex tiling (after Mikkelsen, "Practical Real-Time Hex-Tiling", 2022). The plane is cut
+// into a triangle grid; each corner of the triangle under the pixel owns a random offset into the texture, and the three
+// taps blend by sharpened barycentric weights. Offsets only, no rotation, so tangent-space normals stay valid. Gradients
+// come from the plain uv, so the offset jumps never disturb mip selection. Only for organic ground: on brick or cobble the
+// blend would smear the joints.
+static const float kHexRate = 0.6; // hex cells per texture repeat, roughly
+float2 HexOffset(int2 v) {
+    return float2(TileHash(float2(v) + 0.37), TileHash(float2(v).yx + 17.11));
+}
+float4 SampleNoRepeat(Texture2D<float4> tex, float2 uv) {
+    const float2 dx = ddx(uv), dy = ddy(uv);
+    const float2 st = uv * (kHexRate * 3.4641016); // 2 * sqrt(3)
+    const float2 skew = float2(st.x, -0.57735027 * st.x + 1.15470054 * st.y);
+    const int2 base = int2(floor(skew));
+    const float3 t = float3(frac(skew), 1.0 - frac(skew).x - frac(skew).y);
+    float3 w;
+    int2 v0, v1, v2;
+    if (t.z > 0.0) {
+        w = float3(t.z, t.y, t.x);
+        v0 = base; v1 = base + int2(0, 1); v2 = base + int2(1, 0);
+    } else {
+        w = float3(-t.z, 1.0 - t.y, 1.0 - t.x);
+        v0 = base + int2(1, 1); v1 = base + int2(1, 0); v2 = base + int2(0, 1);
+    }
+    w = pow(w, 7.0); // sharper weights keep each tap's detail; the blend only shows in thin seams
+    w /= (w.x + w.y + w.z);
+    return tex.SampleGrad(gTexSampler, uv + HexOffset(v0), dx, dy) * w.x + tex.SampleGrad(gTexSampler, uv + HexOffset(v1), dx, dy) * w.y +
+           tex.SampleGrad(gTexSampler, uv + HexOffset(v2), dx, dy) * w.z;
+}
+
+// Skin vertex alpha runs from 0.5 (at rest) to 0.59 (fully compressed); see FaceRig::Pose.
+float SkinWrinkle(VSOut i) { return saturate((i.color.a - 0.5) / 0.09); }
+
+// Parallax occlusion near the camera for world materials whose surface map holds a height (surface_maps.h). After Tatarchuk,
+// "Dynamic Parallax Occlusion Mapping", 2006: a linear search whose step count follows the view angle, then one secant step.
+// The tangent frame comes from screen derivatives as in Material, and the depth is in metres, so any UV tile gives the same relief.
+static float2 sPomOffset = float2(0, 0);
+static float sPomShadow = 1.0;
+static float sCavity = 1.0;
+static float sRoughScale = 1.0;
+static bool sArt = false;
+static bool sAuthored = false; // surface map B 0.25..0.35: authored relief (cockpit panels): parallax yes, weathering and tilt shading no
+static const float kPomDepth = 0.010, kPomNear = 7.0, kPomFar = 16.0;
+bool IsWorldSurface(float a) { return a > 0.855 && a < 0.915; }
+bool IsReliefGround(float a) { return abs(a - 0.2) < 0.05; }
+void SurfaceRelief(VSOut i, float depthMetres) {
+    if (FEATURE_OFF(4)) return;
+    const float marker = gSurface.SampleLevel(gTexSampler, float2(0.25, 0.25), 20.0).b;
+    if (marker > 0.35 && marker < 0.65) { sArt = true; return; } // signs and lettering (surface_async.inl)
+    sAuthored = marker > 0.25 && marker <= 0.35;
+    const float4 top = gSurface.Sample(gTexSampler, i.uv);
+    const float dist = length(gLight.eye.xyz - i.worldPos);
+    const float3 ng = normalize(i.normal);
+    const float2 uv = float2(i.uv.x, 1.0 - i.uv.y);
+    const float3 dp1 = ddx(i.worldPos), dp2 = ddy(i.worldPos);
+    const float2 du1 = ddx(uv), du2 = ddy(uv), gx = ddx(i.uv), gy = ddy(i.uv);
+    if (top.b > 0.5) return; // the neutral default: no map
+    sCavity = top.g;
+    sRoughScale = top.r * 2.0;
+    const float fade = saturate((kPomFar - dist) / (kPomFar - kPomNear));
+    if (fade <= 0.0 || FEATURE_OFF(1)) return;
+    const float metresPerUv = sqrt((dot(dp1, dp1) + dot(dp2, dp2)) / max(dot(du1, du1) + dot(du2, du2), 1e-12));
+    const float3 dp2perp = cross(dp2, ng), dp1perp = cross(ng, dp1);
+    const float3 T0 = dp2perp * du1.x + dp1perp * du2.x, B0 = dp2perp * du1.y + dp1perp * du2.y;
+    if (dot(T0, T0) < 1e-20 || dot(B0, B0) < 1e-20) return;
+    const float3 T = normalize(T0), B = normalize(B0);
+    const float3 v = normalize(gLight.eye.xyz - i.worldPos);
+    const float3 vt = float3(dot(v, T), dot(v, B), dot(v, ng));
+    if (vt.z < 0.05) return;
+    const float depthUv = depthMetres * fade / max(metresPerUv, 1e-4);
+    float2 along = vt.xy / max(vt.z, 0.25) * depthUv;
+    along.y = -along.y; // back to the texture's own v
+    const int steps = int(lerp(14.0, 5.0, vt.z));
+    const float stepSize = 1.0 / steps;
+    float layer = 0.0, prevGap = 0.0, gap = 0.0;
+    float2 at = i.uv;
+    [loop] for (int k = 0; k < steps; ++k) {
+        gap = (1.0 - gSurface.SampleGrad(gTexSampler, at, gx, gy).a) - layer;
+        if (gap <= 0.0) break;
+        prevGap = gap;
+        layer += stepSize;
+        at = i.uv - along * layer;
+    }
+    if (gap < 0.0) { // between the last two layers, by similar triangles
+        const float t = prevGap / max(prevGap - gap, 1e-5);
+        layer = layer - stepSize + stepSize * t;
+        at = i.uv - along * layer;
+    }
+    sPomOffset = at - i.uv;
+    const float4 hit = gSurface.SampleGrad(gTexSampler, at, gx, gy);
+    sCavity = hit.g;
+    sRoughScale = hit.r * 2.0;
+    // Toward the sun from the hit, soft: what stands above the ray hides the sun from this pixel (the relief's own shadow).
+    const float3 l = gLight.sunDir.xyz;
+    const float3 lt = float3(dot(l, T), dot(l, B), dot(l, ng));
+    if (lt.z > 0.02) {
+        float2 toSun = lt.xy / max(lt.z, 0.2) * depthUv;
+        toSun.y = -toSun.y;
+        float block = 0.0;
+        const float h0 = hit.a;
+        [loop] for (int k = 1; k <= 4; ++k) {
+            const float s = k / 4.0;
+            const float h = gSurface.SampleGrad(gTexSampler, at + toSun * s * (1.0 - h0), gx, gy).a;
+            block = max(block, (h - (h0 + (1.0 - h0) * s)) * (1.0 - s * 0.5));
+        }
+        sPomShadow = 1.0 - saturate(block * 6.0) * fade;
+    }
+}
+
+// The layered ground (ground_bake.inl): dirt, gravel and wagon-track maps in a 2x2 atlas, with the bake of what stands on the ground in
+// the fourth cell. Layers are chosen by noise, slope and nearness to buildings, height-blended (after Mikkelsen's atlas padding and the
+// material rules in the Decima reference). Surface map layout here: R occlusion, G roughness, B marker, A height.
+float2 GroundCell(float2 p, int cell) {
+    const float2 f = frac(p) * 0.992 + 0.004;
+    return (f + float2(cell & 1, cell >> 1)) * 0.5;
+}
+bool GroundAtlasBound() {
+    const float marker = gSurface.SampleLevel(gTexSampler, float2(0.25, 0.25), 20.0).b;
+    return marker > 0.15 && marker < 0.35;
+}
+// Wagon ruts down the street, which runs along x at z near 0. x: depth 0..1, y: slope across.
+float2 GroundRuts(float2 xz) {
+    const float mask = smoothstep(9.5, 6.0, abs(xz.y)) * (0.45 + 0.55 * smoothstep(0.25, 0.6, TileNoise(xz * 0.09)));
+    float depth = 0.0, slope = 0.0;
+    for (int k = 0; k < 3; ++k) {
+        const float zc = (k - 1.0) * 2.7 + 0.9 * sin(xz.x * 0.021 + k * 2.1) + 0.3 * sin(xz.x * 0.073 + k);
+        const float side = xz.y - zc;
+        const float g = (abs(side) - 0.75) / 0.17;
+        const float rut = exp(-g * g);
+        if (rut > depth) { depth = rut; slope = -2.0 * g * rut * sign(side); }
+    }
+    return float2(depth, slope) * mask;
+}
+// Boot prints along two wandering lines. x: depth.
+float GroundPrints(float2 xz) {
+    float depth = 0.0;
+    for (int k = 0; k < 2; ++k) {
+        const float zc = (k == 0 ? -1.6 : 3.4) + 1.1 * sin(xz.x * 0.05 + k * 3.0);
+        const float2 p = float2(xz.x / 0.74, 0.0);
+        const float id = floor(p.x);
+        if (TileHash(float2(id, k + 2.0)) > 0.75) continue;
+        const float lateral = (fmod(abs(id), 2.0) - 0.5) * 0.24;
+        const float2 d = float2((frac(p.x) - 0.5) * 0.74 / 0.13, (xz.y - zc - lateral) / 0.052);
+        depth = max(depth, 1.0 - smoothstep(0.6, 1.0, dot(d, d)));
+    }
+    return depth;
+}
+
+void GroundLayers(VSOut i, float3 ng, out float3 albedo, out float3 n, out float occlusion, out float roughness, out float near) {
+    const float2 xz = i.worldPos.xz;
+    const float2 gx = ddx(xz), gy = ddy(xz);
+    const float dist = length(i.worldPos - gLight.eye.xyz);
+    if (FEATURE_OFF(64)) { albedo = gAlbedo.SampleGrad(gTexSampler, GroundCell(xz / 3.3, 0), gx / 6.6, gy / 6.6).rgb * 0.78; n = ng; occlusion = 1.0; roughness = 0.8; near = 0.0; return; }
+    const float4 bake = gSurface.SampleLevel(gTexSampler, (saturate((xz + 256.0) / 512.0) * 0.992 + 0.004 + float2(1, 1)) * 0.5, 0.0);
+    near = bake.g; // 1 at a wall's foot, gone about 3 m out
+    // Which layers: gravel where noise and slope and building edges gather it, wagon dust in long slow bands.
+    const float n0 = TileNoise(xz * 0.13) * 0.55 + TileNoise(xz * 0.61 + 3.0) * 0.3 + TileNoise(xz * 2.3) * 0.15;
+    const float gravelWant = smoothstep(0.35, 0.7, (1.0 - ng.y) * 2.2 + (n0 - 0.5) * 0.4);
+    const float tracks = smoothstep(0.42, 0.66, TileNoise(float2(xz.x * 0.03, xz.y * 0.28) + 11.0));
+    const float2 pPom = float2(0.0, 0.0);
+    const float3 v = normalize(gLight.eye.xyz - i.worldPos);
+    const float fade = saturate((15.0 - dist) / 8.0);
+    float2 pomXz = xz;
+    const float kDirtM = 6.1, kGravelM = 0.75, kTrackM = 5.7;
+    const int cellMain = gravelWant > 0.5 ? 1 : 0;
+    const float mainM = cellMain == 1 ? kGravelM : kDirtM;
+    if (fade > 0.0 && v.y > 0.08 && !FEATURE_OFF(1)) { // parallax on the leading layer, within 15 m
+        const float depth = (cellMain == 1 ? 0.03 : 0.006) * fade;
+        const float2 along = v.xz / max(v.y, 0.3) * depth;
+        const int steps = int(lerp(10.0, 4.0, v.y));
+        const float stepSize = 1.0 / steps;
+        float layer = 0.0, prevGap = 0.0, gap = 0.0;
+        float2 at = xz;
+        [loop] for (int k = 0; k < steps; ++k) {
+            gap = (1.0 - gSurface.SampleGrad(gTexSampler, GroundCell(at / mainM, cellMain), gx / mainM * 0.5, gy / mainM * 0.5).a) - layer;
+            if (gap <= 0.0) break;
+            prevGap = gap;
+            layer += stepSize;
+            at = xz - along * layer;
+        }
+        if (gap < 0.0) at = xz - along * (layer - stepSize + stepSize * prevGap / max(prevGap - gap, 1e-5));
+        pomXz = at;
+    }
+    // Sample a layer and a rotated second scale of it, so no repeat lines up.
+    float4 a0, s0;
+    float3 t0;
+    {
+        const float2 p = pomXz / mainM;
+        const float2 q = float2(p.x * 0.8 - p.y * 0.6, p.x * 0.6 + p.y * 0.8) * 1.37 + 0.37;
+        const float2 d1 = gx / mainM * 0.5, d2 = gy / mainM * 0.5;
+        const float m = smoothstep(0.35, 0.65, TileNoise(xz * 0.21 + 5.0));
+        const float2 cp = GroundCell(p, cellMain), cq = GroundCell(q, cellMain);
+        a0 = lerp(gAlbedo.SampleGrad(gTexSampler, cp, d1, d2), gAlbedo.SampleGrad(gTexSampler, cq, d1 * 1.37, d2 * 1.37), m);
+        s0 = lerp(gSurface.SampleGrad(gTexSampler, cp, d1, d2), gSurface.SampleGrad(gTexSampler, cq, d1 * 1.37, d2 * 1.37), m);
+        t0 = lerp(gNormalMap.SampleGrad(gTexSampler, cp, d1, d2).xyz, gNormalMap.SampleGrad(gTexSampler, cq, d1 * 1.37, d2 * 1.37).xyz, m) * 2.0 - 1.0;
+    }
+    // The other layer shows only in the band between them, by height.
+    const float edge = cellMain == 1 ? gravelWant : max(gravelWant, 0.0);
+    if (edge > 0.02 && edge < 0.98) {
+        const int cellOther = cellMain == 1 ? 0 : 1;
+        const float otherM = cellOther == 1 ? kGravelM : kDirtM;
+        const float2 c = GroundCell(pomXz / otherM, cellOther), d1 = gx / otherM * 0.5, d2 = gy / otherM * 0.5;
+        const float4 s1 = gSurface.SampleGrad(gTexSampler, c, d1, d2);
+        const float gravelShare = cellMain == 1 ? edge : edge;
+        const float hMain = s0.a + (cellMain == 1 ? gravelShare : 1.0 - gravelShare), hOther = s1.a + (cellOther == 1 ? gravelShare : 1.0 - gravelShare);
+        const float w = smoothstep(-0.05, 0.05, hOther - hMain); // sharp: single stones sitting on the dirt, not a mush
+        if (w > 0.0) {
+            a0 = lerp(a0, gAlbedo.SampleGrad(gTexSampler, c, d1, d2), w);
+            s0 = lerp(s0, s1, w);
+            t0 = lerp(t0, gNormalMap.SampleGrad(gTexSampler, c, d1, d2).xyz * 2.0 - 1.0, w);
+        }
+    }
+    if (tracks > 0.01 && cellMain == 0) { // wagon-track dust, faded in over the dirt in long soft bands
+        const float2 c = GroundCell(pomXz / kTrackM, 2), d1 = gx / kTrackM * 0.5, d2 = gy / kTrackM * 0.5;
+        const float w = tracks * 0.75;
+        a0 = lerp(a0, gAlbedo.SampleGrad(gTexSampler, c, d1, d2) * 0.82, w);
+        t0 = lerp(t0, gNormalMap.SampleGrad(gTexSampler, c, d1, d2).xyz * 2.0 - 1.0, w);
+    }
+    // Stones take the local dust: most of their photographed colour would read as confetti in this desert.
+    const float stones = cellMain == 1 ? 1.0 : gravelWant;
+    // Colour from a ramp of dry desert dirt, pale tan to rust (display values chosen by eye, not matched to photographs); the map keeps only a
+    // gentle share of its detail, since at full contrast it reads as carpet.
+    const float grey = dot(a0.rgb, float3(0.3, 0.6, 0.1));
+    const float mean = cellMain == 1 ? 0.43 : 0.41;
+    const float detail = lerp(1.0, grey / mean, lerp(0.55, 0.9, stones));
+    const float ramp = smoothstep(0.3, 0.72, TileNoise(xz * 0.021 + 2.0) * 0.6 + TileNoise(xz * 0.13 + 9.0) * 0.4);
+    const float3 dirt = lerp(float3(0.74, 0.58, 0.41), float3(0.66, 0.43, 0.28), ramp);
+    albedo = dirt * detail * lerp(1.0, float3(0.92, 0.88, 0.84), stones);
+    float3 extra = float3(0, 0, 0);
+    // Ruts and prints are packed darker and tilt the light; small stones lie on top, each a stone.
+    const float closeFade = saturate((60.0 - dist) / 25.0);
+    if (closeFade > 0.0) {
+        const float2 rut = GroundRuts(xz);
+        albedo *= 1.0 - 0.2 * rut.x * closeFade;
+        extra.z += rut.y * 0.28 * closeFade;
+    }
+    if (dist < 22.0) {
+        const float printFade = saturate((22.0 - dist) / 8.0);
+        albedo *= 1.0 - 0.2 * GroundPrints(xz) * printFade * smoothstep(9.0, 6.0, abs(xz.y));
+    }
+    occlusion = s0.r;
+    roughness = s0.g;
+    const float strength = lerp(0.12, 0.26, saturate((35.0 - dist) / 22.0));
+    n = normalize(ng + float3(t0.x, 0.0, -t0.y) * strength + extra);
+}
+
+// Albedo and normal after the material textures; alpha below 0.4 is cut out.
+void Material(VSOut i, out float4 color, out float3 n) {
+    n = normalize(i.normal);
+    const bool ground = abs(i.color.a - 0.75) < 0.1; // tiling ground: hide the repeat and vary it at large scale
+    const bool groundSplat = abs(i.color.a - 0.2) < 0.05; // Western terrain: COLOR_0 stores material weights
+    float4 tex = ground ? SampleNoRepeat(gAlbedo, i.uv) : gAlbedo.SampleGrad(gTexSampler, i.uv + sPomOffset, ddx(i.uv), ddy(i.uv));
+    clip(tex.a - 0.4);
+    if (IsWorldSurface(i.color.a) && !sArt) { // a tile's own blotches beat against the eye from afar (old brick above all): pull them toward its average
+        const float far = smoothstep(9.0, 28.0, length(i.worldPos - gLight.eye.xyz));
+        if (far > 0.0) tex.rgb = lerp(tex.rgb, gAlbedo.SampleLevel(gTexSampler, i.uv, 7.0).rgb, far * 0.6);
+    }
+    color = i.color * tex;
+    if (groundSplat) {
+        // The export's COLOR_0 channels encode the splat: green carries the broad vegetation mask,
+        // red the exposed earth mask, and blue the rocky mask. Retain the authored base texture as detail.
+        float3 weights = max(i.color.rgb, 0.0);
+        // Some export triangles have all three weights at zero (8000 vertices of perdition_ground.glb): that drew pure black
+        // slashes on the hills. Fall back to a mostly-earth mix there, fading in so the edge of the patch does not show.
+        const float total = weights.r + weights.g + weights.b;
+        weights = lerp(float3(0.7, 0.2, 0.1), weights / max(total, 1e-4), saturate(total * 20.0));
+        float3 earth = float3(0.46, 0.38, 0.29);
+        float3 grass = float3(0.38, 0.37, 0.24);
+        float3 rock = float3(0.39, 0.36, 0.31);
+        float3 splat = earth * weights.r + grass * weights.g + rock * weights.b;
+        color.rgb = tex.rgb * splat * 1.5;
+        // A second copy at another scale and angle breaks the repeat, and slow patches of paler dust and darker packed earth sit on top.
+        const float2 uv2 = float2(i.uv.x * 0.8 - i.uv.y * 0.6, i.uv.x * 0.6 + i.uv.y * 0.8) * 0.37 + 0.31;
+        const float3 tex2 = gAlbedo.Sample(gTexSampler, uv2).rgb;
+        const float patchA = TileNoise(i.worldPos.xz * 0.11) * 0.6 + TileNoise(i.worldPos.xz * 0.47) * 0.4;
+        const float patchB = TileNoise(i.worldPos.xz * 0.033 + 7.0);
+        color.rgb *= lerp(float3(1, 1, 1), tex2 / max(dot(gAlbedo.SampleLevel(gTexSampler, i.uv, 8.0).rgb, float3(0.33, 0.34, 0.33)), 0.05), 0.5);
+        color.rgb *= lerp(float3(0.78, 0.77, 0.76), float3(1.05, 1.05, 1.05), smoothstep(0.25, 0.75, patchA));
+        color.rgb *= lerp(0.88, 1.08, patchB);
+        // Past the grass instances' reach (about 40 m) the ground takes the grass's dry olive, so the field's edge is a
+        // change of colour, not of kind. One distance and a mix per pixel.
+        const float far = smoothstep(28.0, 60.0, length(i.worldPos - gLight.eye.xyz));
+        color.rgb = lerp(color.rgb, color.rgb * float3(0.80, 0.82, 0.62), far * (0.4 + 0.6 * saturate(weights.g * 2.0)));
+    }
+    if (ground) { // the tile's own contrast reads as blotches from afar: pull it toward its average, then vary at large scale and tint steep rock
+        color.rgb = lerp(gAlbedo.SampleLevel(gTexSampler, i.uv, 8.0).rgb, color.rgb, 0.45);
+        color.rgb *= lerp(0.72, 1.18, TileNoise(i.uv * 0.09) * 0.65 + TileNoise(i.uv * 0.41) * 0.35);
+        color.rgb = lerp(color.rgb, color.rgb * float3(1.25, 0.82, 0.62), smoothstep(0.82, 0.55, n.y));
+    }
+
+    // Tangent frame from screen-space derivatives (no stored tangents). glTF uv has v pointing down the image, the
+    // normal map convention has +Y up, hence the flip.
+    float2 uv = float2(i.uv.x, 1.0 - i.uv.y);
+    float3 dp1 = ddx(i.worldPos), dp2 = ddy(i.worldPos);
+    float2 du1 = ddx(uv), du2 = ddy(uv);
+    float3 dp2perp = cross(dp2, n), dp1perp = cross(n, dp1);
+    float3 T = dp2perp * du1.x + dp1perp * du2.x;
+    float3 B = dp2perp * du1.y + dp1perp * du2.y;
+    float invMax = rsqrt(max(max(dot(T, T), dot(B, B)), 1e-20));
+    const bool skin = abs(i.color.a - 0.5) < 0.1; // skin's normal slot holds a pore tile, repeated and kept subtle
+    const float2 normalUv = skin ? i.uv * SkinDetailScale() : i.uv;
+    float3 tn = (ground ? SampleNoRepeat(gNormalMap, i.uv) : gNormalMap.SampleGrad(gTexSampler, normalUv + sPomOffset, ddx(normalUv), ddy(normalUv))).xyz * 2.0 - 1.0;
+    if (skin) tn = SkinPoreNormal(i.uv, normalUv + sPomOffset, tn);
+    if (ground) tn = normalize(float3(tn.xy * 0.5, 1.0));
+    if (abs(i.color.a - 0.2) < 0.05) { // the splat ground's tile bumps read as ripples from afar; near the feet they are the ground
+        const float nearGround = saturate((30.0 - length(i.worldPos - gLight.eye.xyz)) / 18.0);
+        tn = normalize(float3(tn.xy * lerp(0.25, 1.0, nearGround), 1.0));
+    }
+    if (skin) {
+        // Pores: in skin's soft light (wrapped diffuse, broad highlights, mostly sky) a tilted normal alone barely shows. What
+        // shows a pore is the pit holding back light: the tile's own slope (1 - z) darkens it, faded out before a pore is a pixel.
+        const float pit = saturate((0.975 - tn.z) * 5.0) * saturate(2.0 - length(fwidth(normalUv)) * 512.0);
+        const float depth = SkinPoreDepth();
+        color.rgb *= 1.0 - saturate(0.24 * depth) * pit;
+        // Thin skin (eyelids, around the eyes: the extra map's G toward 0) shows the blood under it: the tutorial's scatter map drives
+        // a hue/saturation node, saturating and darkening the albedo there. Same mask the pore atlas uses to pick its thin-skin tile.
+        const float thinSkin = saturate(1.0 - gExtra.Sample(gTexSampler, i.uv).g * 2.0);
+        { // Blood flush: real skin is not one tone. Two scales of soft blotches push it between a warmer, redder and a cooler, paler
+            // value (cheeks and nose run red, the brow and temples paler), the way capillary density shifts under the surface.
+            const float2 fp = i.uv * 14.0, ft = i.uv * 52.0;
+            const float2 fc = floor(fp), fu = frac(fp), gc = floor(ft), gu = frac(ft);
+            const float2 fs = fu * fu * (3.0 - 2.0 * fu), gs = gu * gu * (3.0 - 2.0 * gu);
+            #define SKIN_H(c) frac(sin(dot((c), float2(127.1, 311.7))) * 43758.5453)
+            const float broad = lerp(lerp(SKIN_H(fc), SKIN_H(fc + float2(1, 0)), fs.x), lerp(SKIN_H(fc + float2(0, 1)), SKIN_H(fc + float2(1, 1)), fs.x), fs.y);
+            const float fine = lerp(lerp(SKIN_H(gc), SKIN_H(gc + float2(1, 0)), gs.x), lerp(SKIN_H(gc + float2(0, 1)), SKIN_H(gc + float2(1, 1)), gs.x), gs.y);
+            #undef SKIN_H
+            const float flush = (broad - 0.5) * 0.7 + (fine - 0.5) * 0.3; // -0.5 .. 0.5
+            color.rgb *= float3(1.0 + 0.10 * flush, 1.0 - 0.07 * flush, 1.0 - 0.09 * flush);
+        }
+        if (thinSkin > 0.01) {
+            const float lum = dot(color.rgb, float3(0.2126, 0.7152, 0.0722));
+            color.rgb = lerp(color.rgb, max(lerp(lum.xxx, color.rgb, 1.35) * 0.88, 0.0), thinSkin * 0.6);
+        }
+        tn = normalize(float3(-tn.xy * 1.1 * depth, 1.0)); // the tilt still catches the highlights; negated: the tile's bumps become pits (divots). 1.1: deep enough to break up the sheen
+        const float w = SkinWrinkle(i);
+        if (w > 0.01) { // the surface map's alpha is a groove height, faded in as the skin compresses
+            const float e = 1.0 / 1024.0;
+            tn.x -= (gSurface.Sample(gTexSampler, i.uv + float2(e, 0)).a - gSurface.Sample(gTexSampler, i.uv - float2(e, 0)).a) * w * 2.5;
+            tn.y += (gSurface.Sample(gTexSampler, i.uv + float2(0, e)).a - gSurface.Sample(gTexSampler, i.uv - float2(0, e)).a) * w * 2.5;
+            tn = normalize(tn);
+        }
+    }
+    if (abs(i.color.a - 0.61) < 0.005) { // cloth: a twill of threads, faded before it is smaller than a pixel
+        const float2 g = i.uv * 1600.0; // radians: 255 threads across the texture, about 3 mm on a shirt
+        const float fade = saturate(2.0 - length(fwidth(g)) * 1.5); // gone before a thread is 4 pixels wide, so it never beats against the screen
+        tn.xy += float2(cos(g.x + g.y), 0.5 * cos(g.x - g.y)) * 0.10 * fade;
+        tn = normalize(tn);
+        color.rgb *= 1.0 + 0.03 * sin(g.x + g.y) * fade;
+    }
+    n = normalize(mul(tn, float3x3(T * invMax, B * invMax, n)));
+}
+
+// ------------------------------------------------------------------ the shared building atlas (docs/building_atlas.md)
+// One material for every zoned building on a page (tools/atlas/pack_atlas.py): the bound albedo and normal are a 4096 page of
+// 8 x 8 cells, each one tile wrapped 16 px past its edges. Vertex alpha 3 + (cell + 0.5) / 64 picks the cell, rgb tints it, and the
+// uv runs in tiles, unwrapped, so a wall repeats its brick. Sampled with the unwrapped uv's gradients (scaled into the cell, so a
+// tile seam is not a mip seam) and capped at kAtlasMaxLod, the deepest mip that never mixes two cells. Albedo alpha is roughness,
+// normal alpha height.
+bool IsAtlasBuilding(float a) { return a > 2.99 && a < 4.01; }
+float2 AtlasCellOrigin(float a) {
+    const float c = clamp(floor((a - 3.0) * 64.0), 0.0, kAtlasGrid * kAtlasGrid - 1.0);
+    return float2(fmod(c, kAtlasGrid), floor(c / kAtlasGrid)) / kAtlasGrid + kAtlasPad / kAtlasGrid;
+}
+float2 AtlasUv(float2 uvTiles, float a) { return AtlasCellOrigin(a) + frac(uvTiles) * ((1.0 - 2.0 * kAtlasPad) / kAtlasGrid); }
+void AtlasGrads(float2 uvTiles, out float2 gx, out float2 gy) {
+    const float inner = (1.0 - 2.0 * kAtlasPad) / kAtlasGrid, cap = exp2(kAtlasMaxLod) / kAtlasSize;
+    gx = ddx(uvTiles) * inner;
+    gy = ddy(uvTiles) * inner;
+    gx *= min(1.0, cap / max(length(gx), 1e-9)); // anisotropic filtering follows the longer axis: cap each
+    gy *= min(1.0, cap / max(length(gy), 1e-9));
+}
+
+// ------------------------------------------------------------------ terrain material, per pixel from world position
+float TerrainHash(float2 p) {
+    p = frac(p * float2(0.1031, 0.1030));
+    p += dot(p, p.yx + 33.33);
+    return frac((p.x + p.y) * p.x);
+}
+float TerrainNoise(float2 p) {
+    float2 c = floor(p), f = p - c;
+    f = f * f * (3.0 - 2.0 * f);
+    return lerp(lerp(TerrainHash(c), TerrainHash(c + float2(1, 0)), f.x),
+                lerp(TerrainHash(c + float2(0, 1)), TerrainHash(c + float2(1, 1)), f.x), f.y);
+}
+// Octaves smaller than a pixel fade out instead of shimmering. Bounded by the coarsest octave's 256 m.
+float TerrainFbm(float2 p, float pixel) {
+    if (FEATURE_OFF(32768)) return 0.5; // cost probe: the flat middle, no noise at all
+    float sum = 0.0, amp = 0.5, scale = 1.0 / 256.0, weight = 0.0;
+    for (int k = 0; k < 11; ++k, amp *= 0.68, scale *= 2.0) { // down to about 12 cm
+        float fade = saturate(0.5 / (pixel * scale) - 0.5);
+        // fade only falls as the octaves shrink: once one is below a pixel, so are the rest. Add their flat 0.5 in closed form and stop,
+        // instead of hashing octaves nobody can see (3 calls x 11 octaves a ground pixel). FLY_FEATURES bit 8192: the full loop, to A/B.
+        if (fade <= 0.0 && !FEATURE_OFF(8192)) {
+            const float rest = amp * (1.0 - pow(0.68, float(11 - k))) / 0.32;
+            sum += 0.5 * rest;
+            weight += rest;
+            break;
+        }
+        sum += amp * fade * TerrainNoise(p * scale + k * 17.0);
+        sum += amp * (1.0 - fade) * 0.5;
+        weight += amp;
+    }
+    return saturate((sum / weight - 0.5) * 2.6 + 0.5); // the sum of many octaves bunches around 0.5
+}
+
+// ------------------------------------------------------------------ the world material atlas (tools/worldtex, world_atlas.hlsli)
+// Gemini photographs of every ground, paving, wall and roof material, one per cell of the atlas bound as albedo + normal for the
+// world draws (fly/game.cpp). Tiles are projected per face from the world position (no uv needed): x/z on the ground, along the
+// face and up it on walls, along the eaves and up the slope on roofs. portals[67].xyz = the floating origin modulo 240 m (a
+// multiple of every tile), so the photographs stay fixed to the world as the origin moves.
+float3 WorldTexPos(float3 wp) { return wp + gLight.portals[67].xyz; }
+float2 WorldCellOrigin(float cell) { return float2(fmod(cell, kAtlasGrid), floor(cell / kAtlasGrid)) / kAtlasGrid + kAtlasPad / kAtlasGrid; }
+// Switches for the photo atlas's cost (FLY_FEATURES bits, read per pixel from a constant so one build measures every variant):
+//   512  turn OFF the exact skips below (for A/B timing): every tap reads, as before 2026-11-17.
+//   1024 the far taps (6x, 36x) filter isotropically at a computed mip (SampleLevel) instead of 8x anisotropic.
+//   2048 drop the 36x tap (the cruise-height patches).
+// (4096 turns the baked city shadows off in the lit draws: city_shadow.hlsli. 512 used to as well.)
+#define WT_EXACT_SKIP (!FEATURE_OFF(512))
+#define WT_FAR_ISO FEATURE_OFF(1024)
+#define WT_NO_36X FEATURE_OFF(2048)
+// How far a tap has faded to its cell's mean: 0 while a texel is no smaller than about an eighth of a pixel, toward 1 where the
+// capped mip would alias. From the gradients alone, so a caller can know a tap is wholly faded before paying for its reads.
+float WorldCellFade(float2 dux, float2 duy) {
+    const float inner = (1.0 - 2.0 * kAtlasPad) / kAtlasGrid;
+    const float foot = max(length(dux * inner), length(duy * inner)) * kAtlasSize; // atlas texels per pixel
+    return saturate(log2(max(foot, 1e-6)) - kAtlasMaxLod + 0.5);
+}
+// One tap of a cell: albedo (a = roughness), normal (a = height), and its fade (the caller swaps in the cell's mean there).
+// Wholly faded (from the air, most walls and roofs): the photograph's colour and relief are discarded anyway, so only the roughness
+// is read, from the deepest safe mip (one cheap, cache-resident read instead of two 8x anisotropic ones).
+void WorldCellTap(float cell, float2 uvTiles, float2 dux, float2 duy, out float4 alb, out float4 nt, out float fade) {
+    const float inner = (1.0 - 2.0 * kAtlasPad) / kAtlasGrid, cap = exp2(kAtlasMaxLod) / kAtlasSize;
+    float2 gx = dux * inner, gy = duy * inner;
+    const float foot = max(length(gx), length(gy)) * kAtlasSize; // atlas texels per pixel
+    fade = saturate(log2(max(foot, 1e-6)) - kAtlasMaxLod + 0.5);
+    const float2 at = WorldCellOrigin(cell) + frac(uvTiles) * inner;
+    if (WT_EXACT_SKIP && fade >= 0.999) {
+        alb = gAlbedo.SampleLevel(gTexSampler, at, kAtlasMaxLod);
+        nt = float4(0.5, 0.5, 1.0, 1.0);
+        return;
+    }
+    gx *= min(1.0, cap / max(length(gx), 1e-9));
+    gy *= min(1.0, cap / max(length(gy), 1e-9));
+    alb = gAlbedo.SampleGrad(gTexSampler, at, gx, gy);
+    nt = gNormalMap.SampleGrad(gTexSampler, at, gx, gy);
+}
+// The far taps use the colour alone (their relief is never used), anisotropic as the near ones or (WT_FAR_ISO) at a computed mip.
+float4 WorldCellAlbedo(float cell, float2 uvTiles, float2 dux, float2 duy) {
+    const float inner = (1.0 - 2.0 * kAtlasPad) / kAtlasGrid, cap = exp2(kAtlasMaxLod) / kAtlasSize;
+    float2 gx = dux * inner, gy = duy * inner;
+    const float2 at = WorldCellOrigin(cell) + frac(uvTiles) * inner;
+    if (WT_FAR_ISO) return gAlbedo.SampleLevel(gTexSampler, at, clamp(log2(max(max(length(gx), length(gy)) * kAtlasSize, 1e-6)), 0.0, kAtlasMaxLod));
+    gx *= min(1.0, cap / max(length(gx), 1e-9));
+    gy *= min(1.0, cap / max(length(gy), 1e-9));
+    return gAlbedo.SampleGrad(gTexSampler, at, gx, gy);
+}
+// The ground's layers: a cell tiled over x/z at its metres, a second tap of the same cell rotated and rescaled blended in by a slow
+// noise, so a lawn or a road never shows its repeat. Returns the albedo relative to the cell's mean (1 = average), the tangent
+// normal's xy (+x east, +y north) and the roughness, all faded to neutral where the pixel outgrows the photograph.
+// Cost (2026-11-17): every tap used to read albedo and normal even where its fade threw the result away; from the air that was most
+// of the ground's reads. Each tap's fade is now known from the gradients first, and a wholly faded tap is not read (exact: the
+// lerps below take the replacement value at fade 1).
+void WorldGroundCell(float cell, float2 xz, float2 dx, float2 dy, out float3 ratio, out float2 nxy, out float rough) {
+    const float m = kWorldTexMetres[(int)cell];
+    float2 uv = float2(xz.x, -xz.y) / m, ux = float2(dx.x, -dx.y) / m, uy = float2(dy.x, -dy.y) / m;
+    const float3 mean = kWorldTexMean[(int)cell];
+    const float2x2 R = float2x2(0.62, -0.58, 0.58, 0.62); // 43 degrees, x 0.85
+    float4 a = float4(mean, 0.9), n0 = float4(0.5, 0.5, 1.0, 1.0), n1 = n0;
+    float fade = 1.0, mixw = 0.0;
+    // the rotated tap is 0.85x, so it fades last: when it is gone, both are
+    if (!WT_EXACT_SKIP || WorldCellFade(ux * 0.85, uy * 0.85) < 0.999) {
+        float4 a0, a1;
+        float f0, f1;
+        WorldCellTap(cell, uv, ux, uy, a0, n0, f0);
+        WorldCellTap(cell, mul(R, uv) + 0.37, mul(R, ux), mul(R, uy), a1, n1, f1);
+        mixw = smoothstep(0.30, 0.70, TerrainNoise(xz / (m * 5.3) + cell * 3.1));
+        a = lerp(a0, a1, mixw);
+        fade = lerp(f0, f1, mixw);
+    }
+    // seen from the air the fine photograph is gone within ~50 m: the same photograph again at 6x its size (rotated, at 70 %
+    // contrast) carries its clumps, patches and stains out to a few hundred metres, then the tuned colour alone
+    float3 far = float3(1, 1, 1);
+    if (fade > 0.01) {
+        const float S = 1.0 / 6.0;
+        const float2x2 R2 = float2x2(0.28, 0.96, -0.96, 0.28); // a pure rotation: the tap's fade is the scaled gradients'
+        const float f2 = WorldCellFade(ux * S, uy * S);
+        float3 far2 = float3(1, 1, 1);
+        if (f2 > 0.01 && !WT_NO_36X) { // and at 36x (a lawn tile ~90 m): from cruise height, mown patches and worn ground rather than one flat green
+            const float S2 = 1.0 / 36.0;
+            const float f3 = WorldCellFade(ux * S2, uy * S2);
+            if (!WT_EXACT_SKIP || f3 < 0.999) {
+                const float4 a3 = WorldCellAlbedo(cell, uv * S2 + 0.23, ux * S2, uy * S2);
+                far2 = lerp(1.0 + (a3.rgb / max(mean, 0.03) - 1.0) * 0.55, float3(1, 1, 1), f3);
+            }
+        }
+        if (!WT_EXACT_SKIP || f2 < 0.999) {
+            const float4 a2 = WorldCellAlbedo(cell, mul(R2, uv) * S + 0.71, mul(R2, ux) * S, mul(R2, uy) * S);
+            far = lerp(1.0 + (a2.rgb / max(mean, 0.03) - 1.0) * 0.7, far2, f2);
+        } else far = far2;
+    }
+    ratio = lerp(a.rgb / max(mean, 0.03), far, fade);
+    float2 t1 = n1.xy * 2.0 - 1.0;
+    t1 = float2(0.62 * t1.x - 0.58 * t1.y, 0.58 * t1.x + 0.62 * t1.y) / 0.85; // the rotated tap's normal back (in u, up-the-image)
+    nxy = lerp(n0.xy * 2.0 - 1.0, t1, mixw) * (1.0 - fade);
+    rough = lerp(a.a, 0.9, fade);
+}
+// Which pavement photograph (fly/world_tex.h kPave*): the alpha's sub-band, else (markings, unclassified) by brightness.
+float PaveCell(float alpha, float3 srgb) {
+    if (abs(alpha - 0.020) < 0.0024) return kWT_asphalt_road;
+    if (abs(alpha - 0.025) < 0.0024) return kWT_asphalt_dark;
+    if (abs(alpha - 0.035) < 0.0024) return kWT_concrete_slab;
+    if (abs(alpha - 0.040) < 0.0024) return kWT_sidewalk;
+    if (abs(alpha - 0.045) < 0.0024) return kWT_parking_asphalt;
+    const float l = dot(srgb, float3(0.2126, 0.7152, 0.0722));
+    return l > 0.62 ? kWT_sidewalk : l > 0.50 ? kWT_concrete_slab : l > 0.36 ? kWT_asphalt_road : kWT_asphalt_dark;
+}
+
+// Mapped ground (vertex alpha 0.08: fly/earth_gen.h CoverColour, fly/city.h fields) and pavement (0.03: roads, lots, driveways): the vertex
+// colour is the land's own colour; the pixel adds what a camera sees in it, fully matte (no plastic sheen at grazing angles). Grass: tufts
+// at several scales, straw-coloured dry patches, soil showing through. Pavement: aggregate, darker patched repairs, oil and tyre stains.
+// Far grass and fields read darker than their albedo: beyond where trees and houses are drawn, their canopies, roofs and the shadows
+// between them still cover a share of every pixel (the photo's distant land is tree lines, not lawn). Fades in over a few km.
+float3 FarCanopy(float3 a, float3 wp) {
+    const float t = smoothstep(1200.0, 5000.0, length(wp - gLight.eye.xyz));
+    return a * lerp(float3(1.0, 1.0, 1.0), float3(0.58, 0.66, 0.70), t);
+}
+// Satellite imagery draped on the ground (fly/game.cpp, Renderer::SetGroundImagery): USDA NAIP aerial photographs (public domain),
+// bound as the surface map of the terrain and town draws, which read nothing else from it. portals[69] = the look (grass hue share,
+// pavement brightness share, fade-in start and end in metres from the eye), portals[70] = u0, v0, du/dx, du/dz, portals[71] = dv/dx,
+// dv/dz, strength (0 = none), gain: scene xz -> uv. Returns its linear colour, and in `weight` how much of it to use: none outside the
+// image, fading in over its outer 3 %, and none close to the eye (its 2.4 m texels would show; the procedural grain takes over).
+float3 GroundImagery(float3 worldPos, float eyeDist, out float weight) {
+    weight = 0.0;
+    const float4 look = gLight.portals[69], m0 = gLight.portals[70], m1 = gLight.portals[71];
+    if (m1.z <= 0.0) return float3(0, 0, 0);
+    const float2 uv = float2(m0.x + m0.z * worldPos.x + m0.w * worldPos.z, m0.y + m1.x * worldPos.x + m1.y * worldPos.z);
+    const float2 e = min(uv, 1.0 - uv);
+    weight = saturate(min(e.x, e.y) / 0.03) * smoothstep(look.z, max(look.w, look.z + 1.0), eyeDist) * m1.z;
+    if (weight <= 0.0) return float3(0, 0, 0);
+    return pow(saturate(gSurface.SampleGrad(gTexSampler, uv, ddx(uv), ddy(uv)).rgb), 2.2) * m1.w;
+}
+// Puts the imagery on a procedural ground colour: grass takes its brightness (field by field, the tree lines, the soil) and look.x of
+// its hue, keeping the rest of the tuned spring hue (the flight is a different season); pavement follows look.y of its brightness.
+float3 OnImagery(float3 a, float3 img, float weight, bool pave) {
+    const float la = max(dot(a, float3(0.2126, 0.7152, 0.0722)), 1e-4), li = dot(img, float3(0.2126, 0.7152, 0.0722));
+    const float4 look = gLight.portals[69];
+    // grass: no brighter than 1.7 x its own level (a verge's texels are half the road's concrete; it would glow along every road)
+    const float k = pave ? 1.0 : min(li, la * 1.7) / max(li, 1e-4);
+    const float3 b = pave ? a * lerp(1.0, clamp(li / la, 0.4, 2.0), look.y) : lerp(a * (li * k / la), img * k, look.x);
+    return lerp(a, b, weight);
+}
+// ------------------------------------------------------------------ farmland, per pixel (fly/game.cpp SetGroundStyle, fly/farm.h)
+// Worked land is marked on the terrain (vertex alpha 0.08 .. 0.10 = none .. all farmland: earth_gen.h FarmWeight, from climate,
+// latitude, slope and how built-up it is), and drawn here field by field, so a farm belt anywhere on Earth reads as one: no
+// textures, no geometry. portals[68]: x, z the floating origin modulo kFarmPeriod (the fields are fixed to the world, not the
+// camera), z the style (>= 0: a surveyed grid of mile sections and quarter-section fields, as the Americas' plains, the value
+// being the share of centre-pivot circles; < 0: irregular fields of the old world, hedged), w the day of the year (the crops'
+// stage). The same hash and grid run on the CPU (fly/farm.h) to plant the windbreaks and farmsteads on the same fields.
+static const float kSection = 1609.344;              // a survey section: one mile
+static const float kFarmPeriod = 64.0 * 1609.344;     // the whole pattern repeats every 64 miles (far past the horizon)
+uint FarmHash(uint x, uint z) { uint h = x * 0x8da6b343u ^ z * 0xd8163841u; h ^= h >> 13; h *= 0x5bd1e995u; h ^= h >> 15; return h; }
+float FarmU(uint h, uint salt) { return float(FarmHash(h, salt) & 0xFFFFu) / 65535.0; }
+uint2 SectionIndex(float2 q) { return uint2(int2(floor(q)) & 63); } // 64 x 64 sections, wrapping with the period
+
+// Creeks: a branching network of draws on rural land, the same as fly/farm.h Creek (which plants their trees). Value noise on the
+// section grid (main creeks) and the quarter-mile grid (their tributaries, only near a main creek), both wrapping with the period.
+// Returns 0 on a creek's line, 1 at its corridor's edge and beyond.
+float CreekNoise(float2 q, uint wrap, uint salt) {
+    const float2 c = floor(q), f = q - c, u = f * f * (3.0 - 2.0 * f);
+    const uint2 i0 = uint2(int2(c) & int(wrap - 1u)), i1 = uint2(int2(c + 1.0) & int(wrap - 1u));
+    const float a = FarmU(FarmHash(i0.x, i0.y), salt), b = FarmU(FarmHash(i1.x, i0.y), salt);
+    const float d = FarmU(FarmHash(i0.x, i1.y), salt), e = FarmU(FarmHash(i1.x, i1.y), salt);
+    return lerp(lerp(a, b, u.x), lerp(d, e, u.x), u.y);
+}
+float Creek(float2 absXZ) {
+    const float c1 = abs(CreekNoise(absXZ / kSection, 64u, 81u) - 0.5);
+    const float c2 = abs(CreekNoise(absXZ / (kSection * 0.25), 256u, 83u) - 0.5);
+    return min(c1 / 0.022, c1 < 0.11 ? c2 / 0.016 : 1.0);
+}
+
+// The crop on a field (by its hash) at this time of year, linear albedo. In May: wheat green and tall, corn and beans just up
+// (soil showing), alfalfa dark green, pasture grey-green, fallow last year's straw. Later wheat ripens gold, then is stubble.
+float3 CropAlbedo(uint fh, float day, float2 along, float pixel, out float rows) {
+    const float c = FarmU(fh, 3u);
+    const float3 soil = lerp(float3(0.21, 0.145, 0.085), float3(0.28, 0.195, 0.11), FarmU(fh, 9u)); // silt loam, wetter to drier (warm brown)
+    const float3 green = float3(0.06, 0.095, 0.035), ripe = float3(0.28, 0.23, 0.11), straw = float3(0.24, 0.20, 0.14);
+    rows = 0.0;
+    if (c < 0.32) { // winter wheat
+        const float r = smoothstep(150.0, 172.0, day), cut = smoothstep(176.0, 186.0, day);
+        rows = 0.25;
+        return lerp(lerp(green * 1.05, ripe, r), straw, cut);
+    }
+    if (c < 0.54) { rows = 1.0; return lerp(soil, green * 1.2, smoothstep(140.0, 200.0, day) * 0.9 + 0.08); } // corn: rows of seedlings
+    if (c < 0.72) { rows = 1.0; return lerp(soil * 0.85, green, smoothstep(160.0, 215.0, day) * 0.9); }       // soybeans, sorghum: bare
+    if (c < 0.80) return green * 0.9;                                                                      // alfalfa, cut and regrowing
+    if (c < 0.93) return lerp(float3(0.10, 0.105, 0.06), float3(0.13, 0.125, 0.08), FarmU(fh, 5u));         // pasture, native grass
+    return straw;                                                                                            // fallow, stubble
+}
+
+// The farmland's colour here (linear), and in `road` how much is a section-line gravel road. absXZ: world metres (wrapped).
+float3 FarmField(float2 absXZ, float pixel, out float road) {
+    const float4 st = gLight.portals[68];
+    road = 0.0;
+    const float day = st.w > 0.0 ? st.w : 140.0;
+    uint fh;
+    float2 along;           // across the field's rows (the direction its drills ran)
+    float edge = 1e9;       // metres to the field's edge
+    float pivotRing = -1.0; // inside a centre pivot: metres from its centre
+    float yard = 0.0;       // a farmstead's yard (fly/farm.h ShelterBelts plants its trees round it)
+    if (st.z >= 0.0) { // a surveyed grid: sections, quarter sections, half quarters
+        const float2 q = absXZ / kSection;
+        const uint2 sec = SectionIndex(q);
+        const float2 f = frac(q) * kSection; // metres inside the section
+        // section-line roads: most section lines carry a gravel road (8 m, its verges a little darker)
+        const float2 dl = min(f, kSection - f);
+        const uint2 lineId = uint2(int2(floor(q + 0.5)) & 63);
+        const float roadX = FarmU(FarmHash(lineId.x, 7u), 11u) < 0.8 ? 1.0 : 0.0; // north-south road on this x line
+        const float roadZ = FarmU(FarmHash(lineId.y, 13u), 17u) < 0.7 ? 1.0 : 0.0;
+        const float w = 4.0 + pixel * 0.5;
+        road = max(roadX * (1.0 - smoothstep(w - 1.0, w + pixel, dl.x)), roadZ * (1.0 - smoothstep(w - 1.0, w + pixel, dl.y)));
+        const uint sh = FarmHash(sec.x, sec.y);
+        if (FarmU(sh, 61u) < 0.33 && f.x > 18.0 && f.y > 18.0 && f.x < 150.0 && f.y < 150.0) yard = 1.0;
+        const uint2 quad = uint2(f > kSection * 0.5);
+        uint qh = FarmHash(sh, quad.x + quad.y * 2u + 1u);
+        const float2 fq = frac(f / (kSection * 0.5)) * kSection * 0.5; // metres inside the quarter
+        const bool pivot = FarmU(qh, 21u) < st.z;
+        if (pivot) {
+            const float r = length(fq - kSection * 0.25);
+            if (r < kSection * 0.25 - 12.0) { fh = FarmHash(qh, 99u); along = float2(r, 0.0); edge = kSection * 0.25 - r; pivotRing = r; }
+            else { fh = FarmHash(qh, 77u); along = fq; edge = min(min(fq.x, fq.y), kSection * 0.5 - max(fq.x, fq.y)); } // the dry corners
+        } else {
+            const float split = FarmU(qh, 31u); // a quarter as one field, or halves either way
+            const bool ns = split < 0.35, ew = split >= 0.35 && split < 0.6;
+            uint part = 0u;
+            float2 g = fq;
+            if (ns) { part = fq.x > kSection * 0.25 ? 1u : 0u; g.x = frac(fq.x / (kSection * 0.25)) * kSection * 0.25; }
+            if (ew) { part = fq.y > kSection * 0.25 ? 1u : 0u; g.y = frac(fq.y / (kSection * 0.25)) * kSection * 0.25; }
+            fh = FarmHash(qh, 40u + part);
+            const float2 size = float2(ns ? kSection * 0.25 : kSection * 0.5, ew ? kSection * 0.25 : kSection * 0.5);
+            edge = min(min(g.x, g.y), min(size.x - g.x, size.y - g.y));
+            along = FarmU(fh, 2u) < 0.5 ? g : g.yx;
+        }
+    } else { // irregular fields (Europe, Asia, Africa): jittered cells about 260 m across, hedgerows between
+        // jittered cells in a stretched frame (strip fields, longer one way), measured back in metres; fly/farm.h OldWorldEdge
+        const float2 S = kFarmPeriod / float2(332.0, 606.0); // about 310 x 170 m, a whole number of cells per period (the CPU agrees)
+        const float2 q = absXZ / S, c0 = floor(q);
+        float d1 = 1e9, d2 = 1e9;
+        uint best = 0u;
+        for (int j = -1; j <= 1; ++j)
+            for (int i = -1; i <= 1; ++i) {
+                const float2 c = c0 + float2(i, j);
+                const int2 cw = int2(c) % int2(332, 606);
+                const uint2 ci = uint2(cw + int2(cw.x < 0 ? 332 : 0, cw.y < 0 ? 606 : 0));
+                const uint h = FarmHash(ci.x + 5000u, ci.y + 9000u);
+                const float2 pt = (c + 0.05 + 0.9 * float2(FarmU(h, 1u), FarmU(h, 2u))) * S;
+                const float d = length((absXZ - pt) / S) * 230.0;
+                if (d < d1) { d2 = d1; d1 = d; best = h; } else if (d < d2) d2 = d;
+            }
+        fh = best;
+        edge = (d2 - d1) * 0.5;
+        const float ang = FarmU(fh, 4u) * 3.14159;
+        along = float2(dot(absXZ, float2(cos(ang), sin(ang))), dot(absXZ, float2(-sin(ang), cos(ang))));
+    }
+    float rows;
+    float3 col = CropAlbedo(fh, day, along, pixel, rows);
+    if (st.z < 0.0 && FarmU(fh, 8u) < 0.3) { rows = 0.0; col = lerp(float3(0.07, 0.11, 0.04), float3(0.10, 0.13, 0.06), FarmU(fh, 5u)); } // meadows and pasture
+    // within the field: the soil's own lighter and darker ground (eroded rises, damp swales), and the machine passes and drill rows
+    col *= lerp(0.86, 1.12, TerrainNoise(absXZ / 170.0 + FarmU(fh, 6u) * 40.0)) * lerp(0.93, 1.05, TerrainNoise(absXZ / 37.0 + 3.0));
+    const float passes = saturate(0.5 * 9.0 / pixel - 0.5), drill = saturate(0.5 * 0.76 / pixel - 0.5);
+    col *= 1.0 + 0.04 * sin(along.x * 6.2831853 / 9.0) * passes + 0.15 * rows * (sin(along.x * 6.2831853 / 0.76) * 0.5 - 0.2) * drill;
+    if (pivotRing >= 0.0) { // a pivot's wheel tracks: dark rings every 55 m
+        const float t = abs(frac(pivotRing / 55.0) - 0.5) * 55.0;
+        col *= 1.0 - 0.12 * (1.0 - smoothstep(0.8, 1.6 + pixel, t)) * saturate(0.5 * 3.0 / pixel - 0.5);
+    }
+    // the field's edge: a strip of grass and weeds along the fence (a hedge in the old world), 2 to 4 m
+    const float margin = st.z >= 0.0 ? 2.5 : 1.8;
+    const float3 fence = st.z >= 0.0 ? float3(0.09, 0.10, 0.05) : float3(0.045, 0.07, 0.025);
+    col = lerp(fence, col, smoothstep(margin - 1.0, margin + pixel, edge));
+    if (yard > 0.0) { // a mown yard inside the shelter belt, a gravel patch by the buildings
+        const float2 fy = frac(absXZ / kSection) * kSection;
+        const float gravel = (fy.x > 55.0 && fy.x < 110.0 && fy.y > 60.0 && fy.y < 95.0) ? 1.0 : 0.0;
+        col = lerp(float3(0.055, 0.09, 0.028) * lerp(0.9, 1.1, TerrainNoise(absXZ / 9.0)), float3(0.27, 0.24, 0.19), gravel);
+    }
+    // creeks: a corridor of rough dark grass under their trees (the CPU plants those), a thin line of water in the main ones
+    const float ck = Creek(absXZ);
+    if (ck < 1.0) {
+        col = lerp(float3(0.05, 0.075, 0.03) * lerp(0.85, 1.1, TerrainNoise(absXZ / 13.0)), col, smoothstep(0.55, 1.0, ck));
+        col = lerp(float3(0.025, 0.04, 0.035), col, smoothstep(0.06, 0.12 + pixel * 0.004, ck));
+    }
+    // the gravel road on top
+    col = lerp(col, float3(0.30, 0.27, 0.21) * lerp(0.9, 1.08, TerrainNoise(absXZ / 6.0)), road);
+    return col;
+}
+float4 MappedGroundPS(VSOut i) {
+    float3 n = normalize(i.normal);
+    float2 p = i.worldPos.xz;
+    const bool pave = i.color.a < 0.05;
+    float pixel = max(length(ddx(p)), length(ddy(p))) + 1e-4;
+    const float k = pave ? 2.5 : 1.0; // pavement grain is finer
+    float h0 = TerrainFbm(p * k, pixel * k);
+    float e = max(pixel, 0.25);
+    float2 g = float2(TerrainFbm((p + float2(e, 0)) * k, pixel * k) - h0, TerrainFbm((p + float2(0, e)) * k, pixel * k) - h0) / e;
+    const float3 toEye = gLight.eye.xyz - i.worldPos;
+    const float eyeDist = length(toEye);
+    const float nearG = pave ? 0.0 : 1.0 - smoothstep(25.0, 250.0, eyeDist); // close up: the sward's relief and gaps show
+    float3 bumped = normalize(n - float3(g.x, 0, g.y) * clamp(e * 3.0, 0.4, 60.0) * (pave ? 0.12 : 0.5 * (1.0 + 2.0 * nearG)));
+    float3 a = pow(saturate(i.color.rgb), 2.2);
+    float rough;
+    float detail = 1.0; // the procedural grain's own light and shade, kept on the imagery
+    if (pave) {
+        const float patchN = TerrainNoise(p / 9.0), stain = TerrainNoise(p / 2.3 + 17.0);
+        detail = lerp(0.86, 1.10, h0);
+        a *= detail;
+        a *= lerp(1.0, 0.80, smoothstep(0.62, 0.70, patchN));  // patched repairs, darker
+        a *= lerp(1.0, 0.88, smoothstep(0.55, 0.85, stain) * 0.7); // oil and tyre stains
+        rough = 0.95;
+    } else {
+        // Real grass albedo (linear): green about 0.09, red about 0.6 of it, blue about a quarter (chlorophyll absorbs blue). The map's
+        // colours were tuned through the haze and came out a third as bright and grey-blue up close; keep their brightness pattern,
+        // set the hue and level from the physics, and leave the air to grey and blue the distance.
+        // Up close (nearG) that; from afar the photo-matched sward, darker and greyer: worn patches, gaps and shade average into it there.
+        const float3 aNear = lerp(a, float3(0.60, 1.0, 0.26) * a.g, 0.8) * 4.2;
+        const float3 aFar = float3(max(a.r, a.g * 0.55), a.g, max(a.b, a.g * 0.42)) * 1.7;
+        a = lerp(aFar, aNear, nearG);
+        // soft mottling, no hard-edged blobs: value noise on a square grid cut by a sharp threshold made angular camouflage patches.
+        // Two rotated octaves (no grid alignment), wide soft thresholds, gentle amounts: drier and lusher swards that fade into each other.
+        const float2 q1 = float2(p.x * 0.80 - p.y * 0.60, p.x * 0.60 + p.y * 0.80), q2 = float2(p.x * 0.28 + p.y * 0.96, -p.x * 0.96 + p.y * 0.28);
+        const float mott = TerrainNoise(q1 / 47.0 + 5.0) * 0.6 + TerrainNoise(q2 / 17.0 + 9.0) * 0.4;
+        const float dry = smoothstep(0.40, 0.85, mott);
+        const float big = TerrainNoise(q2 / 160.0 + 3.0);
+        // A sward is a volume, not a carpet (all from values already here: no extra noise or texture reads):
+        //  - gaps between the tufts are dark, seen looking down; at a slant the blades' sides hide them (canopy gap fraction)
+        //  - looking away from the sun its shadows hide behind the blades and it brightens (the hotspot); looking toward the sun the
+        //    shaded sides face us, darker, but the thin blades glow yellow-green with light coming through
+        const float3 V = toEye / max(eyeDist, 1e-3), L = gLight.sunDir.xyz;
+        const float look = saturate(V.y), phase = dot(V, L);
+        // tufts and clumps at their own scale (the fbm above is ruled by its 256 m octave, flat across a close view): two cheap taps,
+        // rotated off the grid, faded out where a pixel covers them so they never shimmer
+        const float cFade = saturate(0.5 * 0.45 / pixel - 0.5), cFade2 = saturate(0.5 * 1.6 / pixel - 0.5);
+        const float cFade3 = saturate(0.5 * 0.12 / pixel - 0.5);
+        const float clump = (TerrainNoise(q2 / 0.45 + 31.0) - 0.5) * cFade * 0.30 + (TerrainNoise(q1 / 1.6 + 23.0) - 0.5) * cFade2 * 0.25
+                          + (TerrainNoise(q1 / 0.12 + 47.0) - 0.5) * cFade3 * 0.45; // grain: the blades' own light and shade
+        const float tuft = saturate(0.5 + clump * 2.2 + (h0 - 0.5) * 1.2);
+        detail = lerp(1.0, lerp(0.70, 1.15, tuft), (0.35 + 0.65 * look) * (0.4 + 0.6 * nearG)) * (1.0 + 0.16 * phase);
+        a *= detail * lerp(0.93, 1.07, big);
+        a += a * float3(0.35, 0.45, 0.05) * saturate(-phase) * (1.0 - look) * 0.45;
+        a = lerp(a, a * float3(1.30, 1.10, 0.70), dry * 0.22);      // drier, straw-tinged grass, fading in and out
+        a = FarCanopy(a, i.worldPos);
+        rough = 1.0;
+        gSpecular = 0.12; // grass is matte: the blades shade each other's sheen; only a trace of sky reflection at grazing angles
+    }
+    // worked land (vertex alpha 0.08 .. 0.10): the field it lies in, its crop and rows, the fence strips, the section roads
+    const float farm = pave ? 0.0 : saturate((i.color.a - 0.08) / 0.02);
+    if (farm > 0.001) {
+        float road;
+        const float3 fc = FarmField(i.worldPos.xz + gLight.portals[68].xy, pixel, road);
+        a = lerp(a, fc * lerp(1.0, detail, 0.4), farm);
+    }
+    // the photographs (world atlas, tools/worldtex): the real grain of the ground at its true size on top of the tuned colour, and up
+    // close a share of the photograph's own hue. Two materials at most per pixel, each two taps (WorldGroundCell anti-repeat).
+    if (!FEATURE_OFF(64) && gLight.portals[67].w > 0.5) { // w: the atlas is bound (fly/game.cpp)
+        const float2 xz = WorldTexPos(i.worldPos).xz, dxz = ddx(i.worldPos.xz), dyz = ddy(i.worldPos.xz);
+        const float3 s = saturate(i.color.rgb);
+        float cellA, cellB = -1.0, wB = 0.0;
+        if (pave) cellA = PaveCell(i.color.a, s);
+        else {
+            const float lumS = dot(s, float3(0.2126, 0.7152, 0.0722)), sumS = s.r + s.g + s.b + 1e-4;
+            const float sat = (max(s.r, max(s.g, s.b)) - min(s.r, min(s.g, s.b))) / max(max(s.r, max(s.g, s.b)), 1e-4);
+            // grass: lawn and rougher meadow in slow patches, dry grass where the mottling dries it
+            cellA = kWT_grass_lawn; cellB = kWT_grass_meadow;
+            wB = smoothstep(0.35, 0.65, TerrainNoise(p / 90.0 + 11.0));
+            const float2 q2 = float2(p.x * 0.28 + p.y * 0.96, -p.x * 0.96 + p.y * 0.28), q1 = float2(p.x * 0.80 - p.y * 0.60, p.x * 0.60 + p.y * 0.80);
+            if (smoothstep(0.40, 0.85, TerrainNoise(q1 / 47.0 + 5.0) * 0.6 + TerrainNoise(q2 / 17.0 + 9.0) * 0.4) > 0.5) cellB = kWT_dry_grass;
+            if (s.r >= s.g * 0.98 && lumS < 0.62) { cellA = kWT_soil_dirt; cellB = kWT_dry_grass; wB = 0.4; }         // bare earth
+            if (lumS < 0.16 && s.g / sumS > 0.36) { cellA = kWT_forest_floor; cellB = kWT_grass_meadow; wB = 0.3; } // under the woods
+            if (s.r > s.g && s.g > s.b * 1.2 && lumS > 0.50) { cellA = kWT_sand_beach; cellB = -1.0; wB = 0.0; }      // beaches, dunes
+            if (lumS > 0.78 && sat < 0.10) { cellA = kWT_snow; cellB = -1.0; wB = 0.0; }
+            const float rock = smoothstep(0.30, 0.55, 1.0 - n.y);
+            const float bank = saturate((0.08 - i.color.a) / 0.02);
+            if (farm > 0.3) { // worked land: the crop's rows where the field is green, turned soil where it is bare
+                cellB = (a.g > a.r * 1.15) ? kWT_crop_rows : kWT_farmland_plowed;
+                wB = farm;
+            }
+            if (bank > 0.05) { cellB = kWT_mud_wetland; wB = bank; }
+            if (rock > 0.05) { cellB = kWT_rock_cliff; wB = max(wB * (1.0 - rock), rock); }
+        }
+        float3 ratio;
+        float2 nxy;
+        float rT;
+        WorldGroundCell(cellA, xz, dxz, dyz, ratio, nxy, rT);
+        if (cellB >= 0.0 && wB > 0.01) {
+            float3 r2;
+            float2 n2;
+            float rr2;
+            WorldGroundCell(cellB, xz, dxz, dyz, r2, n2, rr2);
+            ratio = lerp(ratio, r2, wB); nxy = lerp(nxy, n2, wB); rT = lerp(rT, rr2, wB);
+        }
+        const float near = 1.0 - smoothstep(40.0, 500.0, eyeDist);
+        const float strength = pave ? 1.0 : lerp(0.75, 1.0, near);
+        const float rl = dot(ratio, float3(0.2126, 0.7152, 0.0722));
+        const float3 rc = lerp(float3(rl, rl, rl), ratio, 0.35 + 0.5 * near); // the photograph's hue: some always, more up close
+        a *= lerp(float3(1, 1, 1), rc, strength);
+        detail *= lerp(1.0, rl, strength); // the imagery keeps the photograph's light and shade (OnImagery takes img * detail)
+        bumped = normalize(bumped + float3(nxy.x, 0.0, nxy.y) * (pave ? 0.55 : 0.8) * strength);
+        if (pave) rough = lerp(rough, rT, 0.7);
+    }
+    float imgW;
+    const float3 img = GroundImagery(i.worldPos, eyeDist, imgW);
+    if (imgW > 0.0) a = OnImagery(a, img * detail, imgW, pave); // the real ground, field by field and lot by lot
+    // the season (portals[68].w, the day of the year; fly/game.cpp FLY_DAY): in the temperate winter grass and lawns go dormant, a
+    // tan grey of the same brightness, whatever colour the summer imagery or the spring palette gave them (north of the tropics)
+    if (!pave) {
+        const float day = abs(gLight.portals[68].w) > 0.0 ? abs(gLight.portals[68].w) : 140.0; // w < 0: the flight water is drawing
+        const float dormant = max(1.0 - smoothstep(60.0, 105.0, day), smoothstep(300.0, 335.0, day));
+        if (dormant > 0.0) {
+            const float l = dot(a, float3(0.2126, 0.7152, 0.0722));
+            a = lerp(a, l * float3(1.12, 1.0, 0.84), dormant * 0.85); // dormant grass is a cool tan grey from the air, not straw
+        }
+    }
+    // open water on the terrain (vertex alpha 0.06: rivers, lakes and ponds from the land cover, fly/world.h; it blends to the land's
+    // 0.08 across a bank): dark, smooth, the sky in it at a slant; the imagery's and the seasons' colours don't apply
+    const float water = pave ? 0.0 : saturate((0.08 - i.color.a) / 0.02);
+    if (water > 0.0) {
+        const float ripple = (TerrainNoise(p / 3.1) - 0.5) * saturate(0.5 * 3.0 / pixel - 0.5);
+        a = lerp(a, float3(0.018, 0.03, 0.032) * (1.0 + 0.15 * ripple), water);
+        bumped = normalize(lerp(bumped, normalize(n + float3(ripple * 0.02, 0, -ripple * 0.015)), water));
+        rough = lerp(rough, 0.2, water); // a river's chop: the sky's sheen, no pin-point sun glints on every pond
+        gSpecular = lerp(gSpecular, gLight.portals[68].w < 0.0 ? 0.05 : 0.8, water); // under the flight water's rivers its sheen would show at the banks
+    }
+    float share;
+    const float cs = CloudSun(i.worldPos);
+    // A sward is a layer of thin translucent blades, not a floor: inside a cast shadow, sun still gets through and between the blades and
+    // the blade sides seen at a slant are lit by the sky, so shadows on grass read far fainter than on pavement (the photo's lawns).
+    const float grassFill = pave ? 0.0 : 0.45;
+    float3 lit = LitPbr(a, bumped, i.worldPos, lerp(grassFill, 1.0, gPixelShadow) * cs, rough, 0.0, cs, share);
+    return float4(lit, 0.76 + 0.23 * share);
+}
+
+// A building's upward face (fly/city.h kRoof, vertex alpha 0.135): the generated roof colour, replaced where there are aerial
+// photographs by the real roof's (look.x of its hue, all of its brightness: membranes, gravel, shingles, the AC units' speckle).
+float4 RoofPS(VSOut i) {
+    const float3 n = normalize(i.normal);
+    float3 a = pow(saturate(i.color.rgb), 2.2);
+    const float eyeDist = length(gLight.eye.xyz - i.worldPos);
+    float w;
+    const float3 img = GroundImagery(i.worldPos, eyeDist, w);
+    w *= smoothstep(60.0, 250.0, eyeDist); // a roof is seen closer than the ground: its 2.4 m texels would blur it up close
+    if (w > 0.0) {
+        const float la = max(dot(a, float3(0.2126, 0.7152, 0.0722)), 1e-4), li = dot(img, float3(0.2126, 0.7152, 0.0722));
+        a = lerp(a, lerp(a * (li / la), img, saturate(gLight.portals[69].x + 0.2)), w);
+    }
+    gSpecular = 0.2;
+    float share;
+    const float cs = CloudSun(i.worldPos);
+    const float3 lit = LitPbr(a, n, i.worldPos, gPixelShadow * cs, 0.8, 0.0, cs, share);
+    return float4(lit, 0.76 + 0.23 * share);
+}
+float4 TerrainPS(VSOut i) {
+    if (abs(i.color.a - 0.135) < 0.008) return RoofPS(i);
+    if (i.color.a > 0.015 && i.color.a < 0.12) return MappedGroundPS(i);
+    float3 n = normalize(i.normal);
+    float2 p = i.worldPos.xz;
+    float pixel = max(length(ddx(p)), length(ddy(p))) + 1e-4;
+    float e = max(pixel, 0.25);
+    float h0 = TerrainFbm(p, pixel);
+    // The fine surface bumps the normal, from the same noise that colors it.
+    float2 g = float2(TerrainFbm(p + float2(e, 0), pixel) - h0, TerrainFbm(p + float2(0, e), pixel) - h0) / e;
+    float3 bumped = normalize(n - float3(g.x, 0, g.y) * clamp(e * 3.0, 0.4, 60.0));
+
+    float y = i.worldPos.y + (h0 - 0.5) * 60.0;
+    float slope = 1.0 - n.y;
+    float3 grass = lerp(float3(0.03, 0.07, 0.016), float3(0.14, 0.16, 0.04), h0);
+    float3 dirt = float3(0.14, 0.10, 0.065);
+    float3 rock = lerp(float3(0.07, 0.065, 0.06), float3(0.30, 0.27, 0.23), h0);
+    float3 sand = float3(0.48, 0.40, 0.25);
+    float3 snow = float3(0.82, 0.86, 0.92);
+    float3 a = FarCanopy(lerp(grass, dirt, smoothstep(0.42, 0.62, TerrainNoise(p / 37.0)) * 0.45), i.worldPos);
+    gSpecular = 0.12; // grass and soil: matte
+    a = lerp(a, sand, smoothstep(-9.0, -14.0, i.worldPos.y + (h0 - 0.5) * 8.0));
+    a = lerp(a, rock, smoothstep(0.10, 0.22, slope + (h0 - 0.5) * 0.22 + saturate((i.worldPos.y - 180.0) / 300.0) * 0.12));
+    a = lerp(a, snow, smoothstep(560.0, 680.0, y) * smoothstep(0.38, 0.14, slope + (0.5 - h0) * 0.2));
+    float imgW;
+    const float3 img = GroundImagery(i.worldPos, length(gLight.eye.xyz - i.worldPos), imgW);
+    if (imgW > 0.0) a = OnImagery(a, img * lerp(0.9, 1.1, h0), imgW, false);
+    float share;
+    float3 lit = LitPbr(a, bumped, i.worldPos, gPixelShadow * CloudSun(i.worldPos), 0.88, 0.0, CloudSun(i.worldPos), share);
+    return float4(lit, 0.76 + 0.23 * share);
+}
+
+// Airliner paint is a pigment coat under a clear lacquer: a second specular lobe, sharp, on the panel's smooth shape (the
+// paint's own normal detail, rivets and seams, shows through only half), with the Fresnel of a dielectric, so the cowl takes
+// on the sky's and the ground's picture at grazing angles and stays its colour face on. The layer below loses what the
+// lacquer reflects. A sun glint on it is a tiny, blinding spot: its distribution is capped where a pixel could not hold it.
+float3 Clearcoat(float3 base, float3 n, float3 ng, float3 world, float shadow, float coat) {
+    const float3 v = normalize(gLight.eye.xyz - world), l = gLight.sunDir.xyz;
+    if (dot(ng, n) < 0.0) ng = -ng;
+    const float3 nc = normalize(lerp(ng, n, 0.5));
+    const float nv = max(dot(nc, v), 1e-3);
+    const float kRough = 0.05;
+    const float fe = EnvBrdf(float3(0.04, 0.04, 0.04), kRough, nv).x;
+    const float3 env = AirframeSky(world, reflect(-v, nc), kRough) * lerp(0.4, 1.0, gMatAO);
+    const float3 hv = normalize(v + l);
+    const float nl = saturate(dot(nc, l)), nh = saturate(dot(nc, hv)), vh = saturate(dot(v, hv));
+    const float a = 0.08 * 0.08, a2 = a * a, dd = nh * nh * (a2 - 1.0) + 1.0;
+    const float D = min(a2 / (3.14159265 * dd * dd), 900.0);
+    const float k = 1.08 * 1.08 / 8.0, G = 1.0 / ((nl * (1.0 - k) + k) * (nv * (1.0 - k) + k) * 4.0);
+    const float F = 0.04 + 0.96 * pow(1.0 - vh, 5.0);
+    const float3 glint = gLight.sunColor.rgb * 3.2 * nl * shadow * 3.14159265 * D * G * F;
+    return base * (1.0 - coat * fe) + coat * (env * fe + glint);
+}
+
+// Material factors from the glTF, packed in the vertex alpha by mesh_import.h.
+void PbrFromAlpha(float a, out float roughness, out float metal) {
+    roughness = a < 0.25 ? 0.92 : 0.72; // the splat ground is dry dirt
+    metal = 0.0;
+    if (a > 0.855 && a < 0.915) {
+        const int code = int(round((a - 0.86) / 0.05 * 63.0));
+        metal = float(code & 1);
+        roughness = max(float(code >> 1) / 31.0, 0.04);
+    }
+}
+
+// Weathering by rule, no painting (the idea of Hsu and Wong, "Simulating dust accumulation", 1995, and of the material graphs in the Decima
+// reference, reduced to what a pixel knows). Dirt climbs from the object's foot, dust lies on what faces up, streaks run down walls and
+// rust eats metal, each broken by noise; the object's origin seeds a small tint so repeated props differ.
+void Weather(VSOut i, float3 ng, inout float3 albedo, inout float roughness, inout float metal) {
+    if (FEATURE_OFF(8)) return;
+    const float3 w = i.worldPos;
+    const float h = max(w.y - i.origin.y, 0.0);
+    const float seed = TileHash(i.origin.xz * 0.37 + i.origin.y);
+    const float seed2 = TileHash(i.origin.zx * 0.71 + 3.1);
+    albedo *= lerp(0.84, 1.12, seed) * lerp(float3(1.05, 0.99, 0.93), float3(0.95, 1.0, 1.06), seed2);
+    const float2 along = abs(ng.x) > abs(ng.z) ? w.zy : w.xy; // across the wall, then up it
+    const float wall = 1.0 - abs(ng.y);
+    const float blotch = TileNoise(w.xz * 1.3 + w.y * 1.1) * 0.6 + TileNoise(w.xz * 5.7 + w.y * 4.9) * 0.4;
+    const float3 dust = float3(0.20, 0.14, 0.09);
+    // Rain streaks: long in y, narrow across, a few of them strong.
+    const float streak = pow(TileNoise(float2(along.x * 2.7 + seed * 40.0, along.y * 0.22)), 3.0) * (0.55 + 0.45 * TileNoise(float2(along.x * 11.0, along.y * 0.6)));
+    if (metal > 0.5 || (h > 2.6 && ng.y > 0.4 && ng.y < 0.995)) { // tin, stove pipes, and a pitched roof high on a building: rust in patches and runs
+        const float rust = smoothstep(0.42, 0.72, TileNoise(w.xz * 0.9 + seed * 30.0) * 0.55 + TileNoise(w.xz * 4.3 + w.y) * 0.3 + streak * 1.2 * (0.3 + wall));
+        albedo = lerp(albedo, float3(0.13, 0.058, 0.03) * lerp(0.7, 1.3, blotch), rust * 0.9);
+        metal = lerp(metal, 0.0, rust);
+        roughness = lerp(max(roughness, 0.42), 0.9, rust);
+    } else {
+        albedo *= 1.0 - 0.32 * saturate(streak * 3.0) * wall;
+    }
+    const float upward = saturate(ng.y);
+    albedo = lerp(albedo, dust * lerp(0.8, 1.2, blotch), upward * upward * smoothstep(0.25, 0.8, blotch) * 0.35);
+    // Splash and blown dirt at the foot, about 55 cm with a noisy top; contact darkness in the last few centimetres (Grounding).
+    const float rise = saturate(1.0 - (h + (blotch - 0.5) * 0.4) / 0.55);
+    albedo = lerp(albedo, dust * lerp(0.75, 1.1, blotch), rise * rise * wall * 0.6);
+    albedo *= lerp(0.35, 1.0, smoothstep(0.0, 0.22, h + (blotch - 0.5) * 0.08));
+    roughness = lerp(roughness, 0.95, max(rise * rise * wall, upward * 0.4));
+}
+
+// Window panes: the sky in Fresnel over a room that is not there. Interior mapping (van Dongen, "Interior Mapping", 2008): the ray enters a
+// box per pane cell, in world axes; floor, ceiling and walls are dim and plain, and a noisy shape stands in for what is inside.
+float4 GlassPS(VSOut i) {
+    const float3 v = normalize(gLight.eye.xyz - i.worldPos);
+    // A pane is often a thin box, and its faces' normals can point away from the viewer: turned to face it, or Fresnel reads a
+    // grazing angle head-on and the pane becomes a mirror.
+    const float3 ng = faceforward(normalize(i.normal), -v, normalize(i.normal));
+    const float3 d = -v;
+    const float3 roomSize = float3(5.0, 3.6, 5.0);
+    const float3 p = i.worldPos / roomSize;
+    const float3 cell = floor(p);
+    const float3 s = sign(d) * 0.5 + 0.5;
+    const float3 t = (cell + s - p) / (d / roomSize + sign(d) * 1e-5 + 1e-6);
+    const float tHit = min(t.x, min(t.y, t.z));
+    const float3 q = (i.worldPos + d * tHit); // on a room's surface
+    float3 room;
+    const float2 grain = t.y <= t.x && t.y <= t.z ? q.xz : float2(q.x + q.z, q.y);
+    const float planks = 0.8 + 0.2 * TileNoise(float2(grain.x * 0.7, grain.y * 6.0));
+    if (t.y <= t.x && t.y <= t.z) room = (d.y < 0.0 ? float3(0.075, 0.048, 0.03) : float3(0.03, 0.024, 0.018)) * planks;
+    else {
+        room = float3(0.06, 0.045, 0.03) * planks;
+        const float row = frac(q.y * 1.6);
+        room *= lerp(1.0, 0.4, step(0.82, row)) * lerp(0.55, 1.0, TileNoise(float2((q.x + q.z) * 3.0, floor(q.y * 1.6) * 7.0)));
+    }
+    room *= saturate(1.0 - 0.12 * tHit) + 0.15;
+    const float cloud = CloudSun(i.worldPos);
+    float skyVis;
+    const float3 ambientIn = IndirectDiffuse(i.worldPos, ng, skyVis);
+    const float nv = saturate(dot(ng, v));
+    const float F = 0.04 + 0.96 * pow(1.0 - nv, 5.0);
+    const float3 r = reflect(d, ng);
+    const float wobble = (TileNoise(i.worldPos.xy * 5.0 + i.worldPos.z * 5.0) - 0.5) * 0.02; // old glass is not flat
+    const float3 refl = SkyReflection(normalize(r + float3(wobble, wobble, -wobble)), 0.05);
+    const float smudge = TileNoise(i.worldPos.xz * 3.0 + i.worldPos.y * 3.0) * 0.5 + TileNoise(i.worldPos.xz * 13.0 + i.worldPos.y * 13.0) * 0.5;
+    const float3 film = float3(0.42, 0.33, 0.24) * ambientIn * 0.012 * smoothstep(0.3, 0.8, smudge);
+    const float3 rh = normalize(v + gLight.sunDir.xyz);
+    const float sunLit = gPixelShadow * cloud;
+    const float glint = pow(saturate(dot(ng, rh)), 1500.0) * 40.0 * sunLit * saturate(dot(ng, gLight.sunDir.xyz) * 8.0);
+    // Wear: a grayscale mask (scratches, fingerprints, drips, grime; Assets\glass) projected along the pane's dominant axis in metres, in
+    // the albedo slot. Mirrored tiling hides the repeat. Dirt scatters light and dims the view through; scratches catch sun and sky.
+    const float3 an = abs(ng);
+    const float2 wuv = an.y > max(an.x, an.z) ? i.worldPos.xz : (an.x > an.z ? i.worldPos.zy : i.worldPos.xy);
+    // Every pane differs: i.color is (across, up, seed) from TagPanes. The seed moves, flips and rescales the mask, and decides how worn
+    // the pane is; the building's origin makes some buildings dirtier than others, and about half the panes gather dirt in their corners.
+    const float2 pane = i.color.rg;
+    const float seed = i.color.b, seed2 = TileHash(float2(seed * 91.7, 3.3)), seed3 = TileHash(float2(seed * 37.1, 8.9));
+    const float building = TileHash(i.origin.xz * 0.37 + i.origin.y);
+    const float2 flip = float2(seed2 > 0.5 ? -1.0 : 1.0, seed3 > 0.5 ? -1.0 : 1.0);
+    const float2 tile = abs(frac((wuv * flip * lerp(0.28, 0.55, seed3) + seed * float2(7.3, 3.1)) * 0.5) * 2.0 - 1.0); // mirrored, 0.9 to 1.8 m per mask
+    const float detail = gAlbedo.Sample(gTexSampler, tile).r;
+    const float paneWear = lerp(0.35, 1.25, seed2 * seed2) * lerp(0.6, 1.2, building);
+    const float sideDist = min(pane.x, 1.0 - pane.x); // in pane fractions
+    const float vertDist = pane.y < 0.5 ? pane.y : (1.0 - pane.y) * 1.8; // dirt settles low: top corners need to be closer
+    const float cornerDist = length(float2(sideDist, vertDist));
+    const float cornerRaw = saturate(1.0 - cornerDist / lerp(0.22, 0.5, seed3));
+    const float cornerGate = step(0.45, TileHash(float2(seed * 53.9, building * 17.0))) * lerp(0.5, 1.0, building); // some panes only
+    const float breakup = gAlbedo.SampleLevel(gTexSampler, tile * 0.8 + 0.37, 2.0).r * 2.5 + TileNoise(pane * 9.0 + seed * 40.0) * 0.6;
+    const float corner = saturate(cornerRaw * cornerRaw * (0.5 + breakup) * 1.6) * cornerGate;
+    const float sill = saturate(1.0 - pane.y * 7.0) * (0.3 + 0.7 * TileNoise(float2(pane.x * 12.0 + seed * 20.0, 1.0))) * cornerGate * 0.5; // a grimy line along the bottom
+    const float edgeDirt = saturate(corner + sill);
+    // Clear glass stays clear: only blotches of the mask's blur count as film, never its overall average, so most of a pane is see-through.
+    const float blotch = smoothstep(0.14, 0.4, gAlbedo.SampleLevel(gTexSampler, tile, 4.0).r * paneWear);
+    const float grime = saturate(blotch * 0.4 + smoothstep(0.3, 0.7, detail) * 0.2 * paneWear + edgeDirt * 1.0);
+    const float scratch = smoothstep(0.3, 0.65, detail) * saturate(paneWear * 1.2 - 0.1);
+    const float fade = saturate(1.0 - length(gLight.eye.xyz - i.worldPos) / 60.0); // far panes read as plain glass
+    const float3 dirtTint = float3(0.42, 0.36, 0.28);
+    const float3 sunWear = gLight.sunColor.rgb * sunLit * saturate(abs(dot(ng, gLight.sunDir.xyz)) * 3.0);
+    const float3 wearLight = dirtTint * grime * (ambientIn * 0.35 + sunWear * 0.04) + (ambientIn * 0.6 + sunWear * 0.5 + refl * 0.5) * scratch * 0.55;
+    room *= 1.0 - 0.45 * grime * fade;
+    const float Fw = saturate(F + grime * 0.02 * fade);
+    // Glass is fully clear: only its reflection is drawn, where it is strong enough to stand alone (towards grazing angles) or the
+    // sun glints in it. Nothing here is blended, so a weaker reflection over the view through cannot be shown and is left out;
+    // dirt and scratches stay in the reflection's colour only. TAA's clamp turns a dithered pane back into a mirror, so no dither.
+    const float3 added = refl * Fw * lerp(1.0, skyVis, 0.3) + gLight.sunColor.rgb * glint + (film + wearLight * fade) * Fw;
+    const float cover = saturate(Fw + glint * 0.05);
+    if (cover < 0.25) discard;
+    return float4(added, -0.99); // negative: the composite's screen-space reflection
+}
+
+// A tooth from FaceRig (alpha 0.995): vertex colour is enamel times how deep in the mouth it stands; u runs from the biting edge to
+// the neck, v is the tooth's own variation. Thin enamel at the edge shows the mouth's dark through it, dentine warms the neck.
+float4 ToothPS(VSOut i) {
+    const float t = i.uv.x, seed = i.uv.y;
+    float3 n = normalize(i.normal);
+    // perikymata: fine horizontal growth ridges in the enamel, gone before they are smaller than a pixel
+    const float phase = t * 62.0 + seed * 40.0, fade = saturate(1.5 - fwidth(phase) * 0.8);
+    const float3 dT = ddy(i.worldPos) * ddx(t) - ddx(i.worldPos) * ddy(t);
+    n = normalize(n + normalize(cross(n, cross(dT, n)) + 1e-6) * sin(phase) * 0.012 * fade);
+    const float ao = saturate(max(i.color.r, max(i.color.g, i.color.b)) / 0.95) * lerp(1.0, 0.8, smoothstep(0.5, 1.0, t));
+    float3 albedo = pow(saturate(i.color.rgb / max(max(i.color.r, max(i.color.g, i.color.b)), 0.02) * 0.92), 2.2);
+    albedo *= lerp(0.93, 1.03, seed) * lerp(0.97, 1.02, TileNoise(float2(t * 7.0, seed * 91.0)));
+    const float edge = 1.0 - smoothstep(0.0, 0.22, t);
+    albedo = lerp(albedo, albedo * float3(0.62, 0.70, 0.80), edge); // translucent edge, cool
+    albedo = lerp(albedo, albedo * float3(1.0, 0.92, 0.78), smoothstep(0.45, 0.95, t)); // dentine through the thin neck
+    const float3 lit = LitMouth(albedo, n, i.worldPos, gPixelShadow, CloudSun(i.worldPos), ao, lerp(0.16, 0.24, t), 0.3, float3(1.0, 0.88, 0.72));
+    return float4(lit, 1.0);
+}
+
+// Gums, palate, floor of the mouth, tongue (alpha 0.985): wet, and full of blood, so light spreads wide and comes out red.
+float4 MouthWetPS(VSOut i) {
+    const float deep = max(i.color.r, max(i.color.g, i.color.b));
+    const float3 lit = LitMouth(pow(saturate(i.color.rgb / max(deep, 0.02) * 0.75), 2.2), normalize(i.normal), i.worldPos, gPixelShadow, CloudSun(i.worldPos),
+                                pow(saturate(deep / 0.76), 1.5), 0.28, 0.6, float3(1.0, 0.45, 0.4));
+    return float4(lit, 1.0);
+}
+
+// An eyeball with the generated map (alpha 0.975): UVs are a front view, r = 1 at the silhouette, iris edge at 0.49 (see
+// gameenginetools\eye_atlas). The iris lies behind the clear cornea, so it is sampled where a ray bent by the cornea would land on it.
+float4 EyePS(VSOut i) {
+    const float3 n = normalize(i.normal), v = normalize(gLight.eye.xyz - i.worldPos);
+    const float2 c = i.uv - 0.5;
+    const float r = length(c) * 2.0, iris = smoothstep(0.53, 0.46, r);
+    const float3 dp1 = ddx(i.worldPos), dp2 = ddy(i.worldPos);
+    const float2 du1 = ddx(i.uv), du2 = ddy(i.uv);
+    const float3 dp2perp = cross(dp2, n), dp1perp = cross(n, dp1);
+    const float3 T = normalize(dp2perp * du1.x + dp1perp * du2.x + 1e-6), B = normalize(dp2perp * du1.y + dp1perp * du2.y + 1e-6);
+    const float3 radial = normalize(T * c.x + B * c.y + 1e-6);
+    const float chamber = iris * sqrt(saturate(1.0 - r * r / (0.49 * 0.49))); // the anterior chamber is deepest over the pupil
+    const float2 refracted = i.uv - float2(dot(v, T), dot(v, B)) / max(dot(n, v), 0.35) * 0.075 * chamber;
+    float3 albedo = pow(saturate(gAlbedo.Sample(gTexSampler, refracted).rgb), 2.2);
+    // The white of the eye is not white: a dim grey-pink, so the iris and the wet glint carry the eye. And the limbal ring,
+    // the dark band where the iris meets the white, which reads strongly on a real eye.
+    albedo = lerp(albedo * float3(0.74, 0.68, 0.66), albedo, iris);
+    albedo *= 1.0 - 0.5 * smoothstep(0.40, 0.48, r) * smoothstep(0.57, 0.49, r);
+    // The cornea is a tighter sphere than the ball, so its normal turns faster; the limbus is where it meets the white.
+    const float3 corneaN = normalize(n + radial * r * 0.55 * smoothstep(0.62, 0.42, r));
+    const float3 irisN = normalize(n - radial * r * 0.4);
+    const float up = -c.y * 2.0, side = abs(c.x) * 2.0;
+    // The upper lid and lashes shade the top of the eyeball deeply (the iris sits in that shadow), less from below and in the corners.
+    const float lid = (1.0 - 0.85 * smoothstep(-0.05, 0.55, up)) * (1.0 - 0.35 * smoothstep(0.15, 0.62, -up)) * (1.0 - 0.45 * smoothstep(0.45, 0.95, side));
+    const float3 lit = LitEyeball(albedo, n, corneaN, irisN, i.worldPos, gPixelShadow, CloudSun(i.worldPos), lid, iris, radial, r);
+    return float4(lit, 1.0);
+}
+
+// ---- Hair cards (vertex alpha 0.68) ---------------------------------------------------------------------------------------------
+// Built by AddHairCards / AddScalpCards in mesh_import.h; the vertex colour packs per card data (src/character/hair_vertex.h):
+//   r = floor(cardRand * 1000) + t * 0.999      g = class + depth * 0.999      b = 0 (colour from the sheet) or packed melanin
+// Classes: 0 scalp, 1 fine (brows, lashes), 2 beard. depth: 0 on the outside of the hair volume .. 1 against the skin.
+// Data mode (b > 0): the albedo slot is the generated strand atlas (R brightness, G root-tip, B strand random, A coverage) and
+// the normal slot its material (R occlusion, G roughness, B cuticle shift); colour comes from melanin, as real hair's does.
+struct HairData {
+    float t, cardRand, depth, melanin, red, grey;
+    int cls;
+    bool melaninMode;
+};
+HairData HairDecode(float4 c) {
+    HairData h;
+    h.cardRand = floor(c.r) / 1000.0;
+    h.t = saturate((c.r - floor(c.r)) / 0.999);
+    h.cls = (int)floor(c.g + 1e-3);
+    h.depth = saturate((c.g - floor(c.g)) / 0.999);
+    const float pb = floor(c.b);
+    h.melaninMode = c.b > 1e-4;
+    h.melanin = saturate((c.b - pb) / 0.999);
+    h.red = floor(pb / 100.0) / 100.0;
+    h.grey = fmod(pb, 100.0) / 99.0;
+    return h;
+}
+
+// Hashed alpha (Wyman and McGuire 2017), screen space and per frame: a pixel keeps a fragment with probability = coverage, so a
+// strand thinner than a pixel, or a far card whose mips averaged its strands into a haze, keeps its true share and TAA resolves
+// it to a soft edge. No sorting, no blending, no mip that eats the hair as it recedes.
+float HairHash(float2 pixel, float salt) {
+    const float2 p = pixel + (gLight.eye.w + salt * 17.0) * 5.588238;
+    return frac(52.9829189 * frac(dot(p, float2(0.06711056, 0.00583715))));
+}
+
+// Melanin to the strand's base colour (Karis's, linear): a ramp through typical linear reflectances of real hair, platinum to
+// black, interpolated in log space (melanin absorbs exponentially). `red` (pheomelanin) keeps red and takes green and blue.
+float3 HairMelaninColor(float m, float red) {
+    static const float3 ramp[6] = {float3(0.78, 0.66, 0.48), float3(0.46, 0.33, 0.18), float3(0.19, 0.115, 0.062),
+                                   float3(0.075, 0.042, 0.024), float3(0.028, 0.017, 0.011), float3(0.0095, 0.0075, 0.0068)};
+    const float x = saturate(m) * 5.0;
+    const int k = min((int)x, 4);
+    float3 c = exp(lerp(log(ramp[k]), log(ramp[k + 1]), x - (float)k));
+    return c * lerp(float3(1.0, 1.0, 1.0), float3(1.12, 0.78, 0.5), saturate(red));
+}
+float3 HairBaseColor(HairData h, float strandRand, float brightness) {
+    float m = h.melanin;
+    m += (strandRand - 0.5) * 0.16 + (h.cardRand - 0.5) * 0.06 + (0.5 - brightness) * 0.08; // no two strands alike
+    m -= 0.07 * smoothstep(0.35, 1.0, h.t);                                                    // sun-worn tips
+    if (frac(strandRand * 7.31 + h.cardRand * 3.17) < h.grey) return float3(0.62, 0.6, 0.56);  // unpigmented strands
+    return HairMelaninColor(m, h.red);
+}
+// The inverse for coloured strand sheets (brows, lashes): pick the absorption colour that shows this colour once scattered.
+float3 HairBaseFromColor(float3 srgb) {
+    return saturate(pow(saturate(srgb), 2.2) * 1.1);
+}
+
+float HairGauss(float b, float x) { return exp(-0.5 * x * x / (b * b)) / (2.5066283 * b); }
+float HairFresnel(float c) { const float f0 = 0.0465; return f0 + (1.0 - f0) * pow(1.0 - c, 5.0); } // eta 1.55
+
+// Marschner et al. 2003 in Karis's real-time form ("Physically Based Hair Shading in Unreal", 2016): the R, TT and TRT lobes
+// around the strand's tangent, and his multiple-scattering diffuse with the colour that deep light takes on. Per unit irradiance,
+// times pi to match this engine's sun (LitPbr's diffuse carries no 1/pi). `shadow` is how much direct sun reaches the strand.
+void HairBsdf(float3 T, float3 V, float3 L, float3 N, float3 base, float rough, float shift, float shadow, float backlit,
+              out float3 spec, out float3 diffuse) {
+    const float sinL = clamp(dot(T, L), -1.0, 1.0), sinV = clamp(dot(T, V), -1.0, 1.0);
+    const float cosThetaD = cos(0.5 * abs(asin(sinV) - asin(sinL)));
+    const float3 Lp = L - sinL * T, Vp = V - sinV * T;
+    const float cosPhi = dot(Lp, Vp) * rsqrt(dot(Lp, Lp) * dot(Vp, Vp) + 1e-4);
+    const float cosHalfPhi = sqrt(saturate(0.5 + 0.5 * cosPhi));
+    const float n = 1.55, np = 1.19 / cosThetaD + 0.36 * cosThetaD, a = 1.0 / np;
+    const float B0 = rough * rough, B1 = 0.5 * B0, B2 = 2.0 * B0;
+    const float x = sinL + sinV;
+    spec = 0.0;
+    // R: the cuticle's own reflection, white, shifted toward the root by the scales' tilt
+    {
+        const float Mp = HairGauss(B0, x + 2.0 * shift), Np = 0.25 * cosHalfPhi;
+        const float Fp = HairFresnel(sqrt(saturate(0.5 + 0.5 * dot(L, V))));
+        spec += Mp * Np * Fp * lerp(1.0, backlit, saturate(-cosPhi));
+    }
+    // TT: through the strand, the glow of back-lit hair
+    {
+        const float Mp = HairGauss(B1, x - shift);
+        const float h = cosHalfPhi * (1.0 + a * (0.6 - 0.8 * cosPhi));
+        const float f = HairFresnel(cosThetaD * sqrt(saturate(1.0 - h * h)));
+        const float Fp = (1.0 - f) * (1.0 - f);
+        const float3 Tp = pow(base, 0.5 * sqrt(saturate(1.0 - h * h * a * a)) / cosThetaD);
+        const float Np = exp(-3.65 * cosPhi - 3.98);
+        spec += Mp * Np * Fp * Tp * backlit;
+    }
+    // TRT: in, off the far wall, out: the coloured second highlight
+    {
+        const float Mp = HairGauss(B2, x - 4.0 * shift);
+        const float f = HairFresnel(cosThetaD * 0.5);
+        const float Fp = (1.0 - f) * (1.0 - f) * f;
+        const float3 Tp = pow(base, 0.8 / cosThetaD);
+        const float Np = exp(17.0 * cosPhi - 16.78);
+        spec += Mp * Np * Fp * Tp;
+    }
+    // Multiple scattering: light that wandered through many strands comes out soft, from all round, and in the hair's colour
+    const float kajiya = 1.0 - abs(sinL);
+    const float3 fakeN = normalize(V - T * sinV);
+    const float wrapNl = saturate((dot(fakeN, L) + 1.0) * 0.25);
+    const float shellNl = saturate((dot(N, L) + 0.35) / 1.35);
+    const float luma = max(dot(base, float3(0.2126, 0.7152, 0.0722)), 1e-4);
+    const float3 scatterTint = pow(base / luma, 1.0 - shadow);
+    // Karis takes sqrt(base) here; against this engine's sun that lit brown hair tan, brighter than the skin beside it. Real
+    // multiple scattering brightens brown hair by well under 2x (more for blond, where little is absorbed between bounces).
+    diffuse = base * lerp(1.45, 1.15, luma * 2.0) * (lerp(wrapNl, kajiya, 0.33) * shellNl / 3.14159265) * scatterTint;
+    spec *= 3.14159265;
+    diffuse *= 3.14159265;
+}
+
+// The hair cap's strands, procedural: uv is (across, along) in metres on the cap. Clumps ~0.6 mm across and strands ~0.12 mm,
+// long along the flow; as they shrink under a pixel they settle to their mean, so the cap never shimmers. Returns the same
+// channels as the strand atlas (R brightness, G unused, B strand random, A coverage 1).
+float4 HairCapStrands(float2 uv) {
+    const float2 clumpUv = float2(uv.x * 1650.0, uv.y * 90.0), fineUv = float2(uv.x * 8300.0, uv.y * 260.0);
+    const float clumpFade = saturate(1.6 - max(fwidth(clumpUv.x), fwidth(clumpUv.y)) * 1.2);
+    const float fineFade = saturate(1.6 - max(fwidth(fineUv.x), fwidth(fineUv.y)) * 1.2);
+    const float clump = lerp(0.5, TileNoise(clumpUv) * 0.7 + TileNoise(clumpUv * float2(2.1, 1.7) + 3.1) * 0.3, clumpFade);
+    const float fine = lerp(0.5, TileNoise(fineUv + clump * 4.0), fineFade);
+    return float4(lerp(0.5, fine, 0.6) * 0.6 + clump * 0.4, 0.5, frac(fine * 3.7 + clump * 1.3), 1.0);
+}
+
+// Hairline fur through the shell stack (AddHairShell): uv is (across, along) in metres over the hairline band, t the shell's height.
+// Roots sit in cells 0.16 mm across by 0.6 mm along the flow, one jittered root each, kept with the band's density; every hair has
+// its own length and leans over along the flow (it lies ~25 degrees off the skin), so through the shells it is a slanted, tapering
+// line. Returns the atlas channels (R brightness, G unused, B strand random, A coverage).
+float4 HairShellFur(float2 fc, float t, float density) {
+    const float thick = 0.0035, lean = 2.4; // metres of shell stack; flow travel per metre of height
+    const float2 cell = float2(0.00013, 0.0006);
+    const float2 p = float2(fc.x, fc.y - t * thick * lean) / cell;
+    const float2 base = floor(p);
+    // this cell's root and the one below it (a leaning hair reaches into the next cell); no branches, so it compiles small and fast
+    const float2 c0 = base, c1 = base - float2(0.0, 1.0);
+    const float4 ha = float4(TileHash(c0), TileHash(c0 + 17.31), TileHash(c0 + 41.7), TileHash(c0 + 7.9));
+    const float4 hb = float4(TileHash(c1), TileHash(c1 + 17.31), TileHash(c1 + 41.7), TileHash(c1 + 7.9));
+    const float2 len = lerp(0.35, 1.0, float2(ha.z * ha.z, hb.z * hb.z)); // each hair's length, as a share of the stack
+    const float2 keep = step(float2(ha.x, hb.x), density) * step(t, len);
+    const float2 r = 0.42 * (1.0 - 0.7 * t / len);                      // tapering toward the tip
+    const float2 da = p - (c0 + float2(0.2 + 0.6 * ha.y, 0.5 * ha.w)), db = p - (c1 + float2(0.2 + 0.6 * hb.y, 0.5 * hb.w));
+    const float a0 = saturate(1.0 - length(float2(da.x / r.x, da.y / 1.1))) * keep.x;
+    const float a1 = saturate(1.0 - length(float2(db.x / r.y, db.y / 1.1))) * keep.y;
+    return float4(0.5, 0.5, a0 >= a1 ? ha.z : hb.z, smoothstep(0.0, 0.35, max(a0, a1)));
+}
+
+float4 HairCardPS(VSOut i) {
+    const HairData h = HairDecode(i.color);
+    const bool cap = h.cls == 3, shell = h.cls == 4;
+    float4 tex = cap ? HairCapStrands(i.uv) : shell ? HairShellFur(i.uv, h.t, h.depth) : gAlbedo.Sample(gTexSampler, i.uv);
+    if (shell) tex.a *= saturate((1.5 - length(gLight.eye.xyz - i.worldPos)) / 0.45); // close range only: gone by 1.5 m
+    const float3 dpx = ddx(i.worldPos), dpy = ddy(i.worldPos); // before any clip: gradients stay defined
+    const float dtx = ddx(h.t), dty = ddy(h.t), dvx = ddx(i.uv.y), dvy = ddy(i.uv.y);
+    // Coverage. Magnified (a strand several pixels wide): sharpened by its screen-space slope to a one-pixel ramp, so strands are
+    // crisp and only their edge pixel is hashed (after Golus). Minified: the slope is wide, the sharpening fades out, and the mip's
+    // averaged alpha is hashed as it is, which keeps the far hair's true coverage. The root of a scalp card is dense; a little
+    // extra there keeps the parting from reading bald.
+    float coverage = tex.a;
+    if (h.cls == 0) coverage = saturate(coverage * lerp(1.25, 1.0, smoothstep(0.0, 0.3, h.t)));
+    const float slope = max(fwidth(coverage), 1e-4);
+    coverage = lerp(saturate((coverage - 0.42) / slope + 0.5), coverage, saturate(slope * 1.5 - 0.25));
+    if (cap) coverage = h.t; // the cap: whole inside, fading out at the hairline
+    if (shell) coverage = tex.a;
+    if (h.cls == 5) coverage = 1.0 - smoothstep(0.5, 1.0, h.t); // wet tissue: solid, thinning out toward the card's far edge
+    clip(coverage - lerp(0.02, 0.98, HairHash(i.pos.xy, h.cardRand)));
+
+    if (h.cls == 5) { // wet tissue (caruncle, tear line): a moist pink, glossy as the inside of the mouth, blood-red where light spreads
+        const float3 wetN = normalize(i.normal) * (dot(normalize(i.normal), gLight.eye.xyz - i.worldPos) < 0.0 ? -1.0 : 1.0);
+        const float3 wet = LitMouth(float3(0.52, 0.17, 0.16), wetN, i.worldPos, gPixelShadow, CloudSun(i.worldPos),
+                                    0.8, 0.12, 0.6, float3(1.0, 0.45, 0.4));
+        return float4(wet, 1.0);
+    }
+    float3 N = normalize(i.normal);
+    // The strand runs root to tip: the direction t grows in, across the pixel. Fall back to the atlas's v where t is flat.
+    float3 tg = dpx * dty - dpy * dtx;
+    if (dot(tg, tg) < 1e-24) tg = dpx * dvy - dpy * dvx;
+    if (cap || shell) tg = cross(dpy, N) * dvx + cross(N, dpx) * dvy; // the surface gradient of `along`: the combing direction
+    float3 T = dot(tg, tg) > 1e-24 ? normalize(tg - N * dot(tg, N) * 0.5) : normalize(cross(N, float3(0.0, 1.0, 0.0)) + 1e-5);
+
+    float4 mat = float4(0.9, 0.55, 0.5, 1.0);
+    float3 base;
+    if (cap || shell) {
+        mat = float4(0.8, 0.62, 0.5, 1.0);
+        base = HairBaseColor(h, tex.b, tex.r);
+    } else if (h.melaninMode) {
+        mat = gNormalMap.Sample(gTexSampler, i.uv);
+        base = HairBaseColor(h, tex.b, tex.r);
+    } else {
+        base = HairBaseFromColor(tex.rgb) * lerp(0.9, 1.1, h.cardRand);
+    }
+    // Per strand: each one wanders a few degrees off the card's direction, so highlights break up along the strands
+    const float strand = h.melaninMode ? tex.b : frac(h.cardRand * 13.7 + i.uv.x * 41.0);
+    const float wander = strand - 0.5;
+    const float3 B = normalize(cross(N, T) + 1e-5);
+    T = normalize(T + B * wander * 0.15 + N * (frac(strand * 9.1) - 0.5) * 0.15); // small: big tilts lit whole cards in blotches
+
+    const float3 V = normalize(gLight.eye.xyz - i.worldPos), L = gLight.sunDir.xyz;
+    // wide enough that neighbouring cards a few degrees apart share one sheen band; narrow lobes lit card by card in blotches
+    const float rough = lerp(0.32, 0.5, mat.g) * (h.cls == 1 ? 1.0 : 1.0);
+    const float shift = lerp(0.025, 0.07, mat.b) * (h.cls == 1 ? 0.5 : 1.0);
+    const float cloud = CloudSun(i.worldPos);
+    const float shadow = gPixelShadow * cloud;
+    // Inside the volume: the strands around shut out sky and bounce, more the deeper (Karis's "hair occlusion" by depth).
+    const float rootDark = lerp(h.cls == 1 ? 0.75 : 0.45, 1.0, smoothstep(0.0, 0.45, h.t));
+    const float vdepth = shell ? 0.25 * (1.0 - h.t) : h.depth; // shells carry density where the others carry depth
+    // the cap is the hair's inside: what shows of it between cards is in the shade of the strands around it
+    const float ao = saturate(mat.r * 1.05) * rootDark * lerp(1.0, 0.35, vdepth) * (cap ? 0.6 : 1.0);
+    // The sun's way out through the hair around it: shadowed strands deep inside still see a little, coloured light
+    const float volumeShadow = shadow * lerp(1.0, 0.55, vdepth * saturate(1.0 - dot(N, L)));
+    // Back light: how much reaches the strand from behind; the head itself blocks it unless the strand is at the rim
+    const float backlit = saturate(volumeShadow * 1.4);
+
+    float3 spec, diffuse;
+    HairBsdf(T, V, L, N, base, rough, shift, volumeShadow, backlit, spec, diffuse);
+    spec *= 0.38 * lerp(0.45, 1.25, frac(strand * 3.7 + h.cardRand)); // strands differ in how clean their cuticle is
+    const float3 sun = gLight.sunColor.rgb * 3.2;
+    float3 direct = sun * (spec * volumeShadow + diffuse * lerp(volumeShadow, 1.0, 0.12) * lerp(1.0, 0.6, vdepth)) * (cap ? 0.55 : 1.0);
+
+    float skyVis;
+    gSunCover = 0.0;
+    const float3 irradiance = SurfaceIrradiance(i.worldPos, N, cloud, skyVis);
+    // Ambient: the multiple-scattered hair colour under the sky and probes, and a dim sheen of the sky along the strands
+    const float3 ambientDiffuse = irradiance * base * 0.92 * ao;
+    const float3 R = normalize(reflect(-V, N) * 0.5 + N * 0.5);
+    const float3 sheenDir = normalize(R - T * dot(R, T) * 0.5);
+    const float3 ambientSpec = lerp(irradiance, SkyReflection(sheenDir, 0.5), skyVis) * 0.06 * ao * lerp(1.0, base * 2.0, 0.4);
+    const float3 ambientPart = ambientDiffuse + ambientSpec;
+    gMatAO = ao;
+    if (gLight.lightDebug.x > 0.5) {
+        if (gLight.lightDebug.x < 1.5) return float4(irradiance, 0.9);
+        if (gLight.lightDebug.x < 2.5) return float4(direct, 0.9);
+    }
+    const float la = dot(ambientPart, float3(0.2126, 0.7152, 0.0722)), ld = dot(direct, float3(0.2126, 0.7152, 0.0722));
+    const float share = la / max(la + ld, 1e-4);
+    return float4(ambientPart + direct, 0.76 + 0.23 * share);
+}
+
+// Hair cards into the shadow maps (DrawShadowCasterCutout): depth only where the strands are. Hashed against a fixed pattern in
+// the map, so the shadow holds still from frame to frame; the map's filter turns the hash into partial shadow.
+struct VSOutShadowCut {
+    float4 pos : SV_Position;
+    float2 uv : TEXCOORD0;
+    float cls : TEXCOORD1;
+};
+VSOutShadowCut ShadowCutoutVS(VSIn v) {
+    VSOutShadowCut o;
+    o.pos = mul(pc.mvp, float4(v.pos, 1.0));
+    o.uv = v.uv;
+    o.cls = floor(v.color.g + 1e-3);
+    return o;
+}
+void PSShadowCutout(VSOutShadowCut i) {
+    if (i.cls > 2.5) discard; // the hair cap lies on the scalp under the cards: they cast, it need not
+    const float a = gAlbedo.Sample(gTexSampler, i.uv).a;
+    clip(a - lerp(0.08, 0.92, frac(52.9829189 * frac(dot(i.pos.xy, float2(0.06711056, 0.00583715))))));
+}
+
+// Silhouette parallax occlusion volumes ("SPOM"): a balcony or canopy drawn as a few quads, its real shape carried by a relief
+// texture. Vertex alpha 0.8 marks it (a glTF material whose name contains "spom"; mesh_import.h). The mesh is a plain box standing out
+// from a wall; each pixel of the box marches a ray through it against the relief and discards where the ray leaves empty-handed, so the
+// outline is the relief's outline, not the box's. After Policarpo/Oliveira "Relief Mapping of Non-Height-Field Surface Details" (2006)
+// and Dummer's cone-free linear+binary search; the volume form is the "parallax box" of Tatarchuk-style silhouette work.
+//   volume frame  T = cross(up, N), B = cross(N, T) (= up for an upright N), N = the vertex normal (the FACADE's outward normal on all six faces, not the face's)
+//   uv            this vertex's (x, y) in metres from the volume's lower-left corner on the wall, along T and B
+//   color.rgb     width, height (metres) and the vertex's depth out from the wall along N (0 .. kSpomDepth)
+//   relief        a layer of solid per texel, [start, end] metres out from the wall: albedo.a = end / kSpomDepth, normal.a = start / kSpomDepth.
+//                 Empty (end <= start) lets the ray pass. Two layers (not a height field) so a baluster can stand free of the wall.
+//                 albedo.rgb and the normal map's rgb are the relief's own colour and fine detail, sampled at the same uv.
+// Not written: depth (a pixel keeps its box face's depth: writing SV_Depth would switch off early-z for every material in this shader).
+static const float kSpomDepth = 1.2;
+float2 SpomRange(float2 m, float2 size) { // x: where the solid starts, y: where it ends, metres from the wall
+    // Snapped to the texel's centre, so bilinear filtering returns that texel's own start and end: blended between a rail and
+    // the empty texel beside it, the pair would read as a phantom sliver of solid half way out.
+    float2 dim; gAlbedo.GetDimensions(dim.x, dim.y); // any size: a 9 m wall strip needs more texels across than a balcony
+    const float2 uv = (floor(float2(m.x / size.x, 1.0 - m.y / size.y) * dim) + 0.5) / dim;
+    return float2(gNormalMap.SampleLevel(gTexSampler, uv, 0.0).a, gAlbedo.SampleLevel(gTexSampler, uv, 0.0).a) * kSpomDepth;
+}
+bool SpomSolid(float3 q, float2 size) { const float2 r = SpomRange(q.xy, size); return r.y > r.x + 0.004 && q.z >= r.x && q.z <= r.y; }
+float4 SpomPS(VSOut i) {
+    // A volume may lean (a tapering lattice face): T stays horizontal, B runs up the face. For an upright N, B = world up.
+    // color.b > 5 marks a single-quad volume ("SPOM quad"): one 2-triangle face lying on the relief's centre plane instead of a
+    // box. Its depth is color.b - 10, and the ray is first stepped back to where it entered the volume.
+    const float3 N = normalize(i.normal);
+    const float3 T = normalize(cross(float3(0.0, 1.0, 0.0), N));
+    const float3 B = normalize(cross(N, T));
+    const float2 size = max(i.color.rg, 0.05);
+    const bool quad = i.color.b > 5.0;
+    float3 p0 = float3(i.uv, quad ? i.color.b - 10.0 : i.color.b);
+    const float3 vw = normalize(i.worldPos - gLight.eye.xyz);
+    const float3 d = float3(dot(vw, T), dot(vw, B), dot(vw, N));
+    float tBack = 0.0;
+    if (quad) {
+        float3 tb = float3(1e9, 1e9, 1e9);
+        if (abs(d.x) > 1e-5) tb.x = d.x > 0.0 ? p0.x / d.x : (p0.x - size.x) / d.x;
+        if (abs(d.y) > 1e-5) tb.y = d.y > 0.0 ? p0.y / d.y : (p0.y - size.y) / d.y;
+        if (abs(d.z) > 1e-5) tb.z = d.z > 0.0 ? p0.z / d.z : (p0.z - kSpomDepth) / d.z;
+        tBack = max(min(tb.x, min(tb.y, tb.z)), 0.0);
+        p0 -= d * tBack;
+    }
+    // Where the ray leaves the box [0,W] x [0,H] x [0,kSpomDepth] (slab method), starting from this face's point.
+    float3 tFar = float3(1e9, 1e9, 1e9);
+    if (abs(d.x) > 1e-5) tFar.x = d.x > 0.0 ? (size.x - p0.x) / d.x : -p0.x / d.x;
+    if (abs(d.y) > 1e-5) tFar.y = d.y > 0.0 ? (size.y - p0.y) / d.y : -p0.y / d.y;
+    if (abs(d.z) > 1e-5) tFar.z = d.z > 0.0 ? (kSpomDepth - p0.z) / d.z : -p0.z / d.z;
+    const float tExit = max(min(tFar.x, min(tFar.y, tFar.z)), 0.0);
+    if (tExit < 1e-4) discard;
+    // Linear search for the first solid sample, then bisection: the thin slab and the balusters need the 2nd part to be sharp.
+    const int steps = clamp((int)ceil(tExit / 0.02), 64, 256); // thin parts must not fall between two samples; long volumes (a whole
+                                                                   // pylon face) need more than a 4 m bay
+    const float dt = tExit / steps;
+    float tLo = 0.0, tHi = 0.0;
+    bool hit = false;
+    [loop] for (int k = 0; k <= steps; ++k) {
+        tHi = dt * k;
+        if (SpomSolid(p0 + d * tHi, size)) { hit = true; break; }
+        tLo = tHi;
+    }
+    if (!hit) discard;
+    [unroll] for (int r = 0; r < 6; ++r) {
+        const float tm = 0.5 * (tLo + tHi);
+        if (SpomSolid(p0 + d * tm, size)) tHi = tm; else tLo = tm;
+    }
+    const float3 q = p0 + d * tHi;
+    const float2 uv = float2(q.x / size.x, 1.0 - q.y / size.y);
+    const float4 albedo = gAlbedo.SampleLevel(gTexSampler, uv, 0.0);
+    // Normal: the relief's own edge, from the gradient of whichever face of the layer was hit (its front, or its back when the
+    // ray came at it from behind), so the slab's rim and a baluster's flank point sideways; plus the normal map's fine detail.
+    float2 dim; gAlbedo.GetDimensions(dim.x, dim.y);
+    const float2 e = 3.5 / dim * size; // wide enough to average out the relief's 8-bit depth steps on rounded shapes (cattle)
+    const float2 rC = SpomRange(q.xy, size);
+    const bool back = abs(q.z - rC.x) < abs(q.z - rC.y) && rC.y > rC.x + 0.004 && rC.x > 0.02;
+    const float2 rx = SpomRange(q.xy + float2(e.x, 0), size) - SpomRange(q.xy - float2(e.x, 0), size);
+    const float2 ry = SpomRange(q.xy + float2(0, e.y), size) - SpomRange(q.xy - float2(0, e.y), size);
+    const float gx = (back ? rx.x : rx.y) / (2.0 * e.x), gy = (back ? ry.x : ry.y) / (2.0 * e.y);
+    float3 nl = normalize(float3(-gx, -gy, 1.0) * (back ? -1.0 : 1.0));
+    const float3 nm = gNormalMap.SampleLevel(gTexSampler, uv, 0.0).xyz * 2.0 - 1.0;
+    nl = normalize(nl + float3(nm.xy * 0.6, 0.0));
+    const float3 n = normalize(T * nl.x + B * nl.y + N * nl.z);
+    const float3 wp = i.worldPos + vw * (tHi - tBack);
+    // Its own shadow: toward the sun through the volume, four taps. The slab shades the rail below it, the rail the floor behind it.
+    float shade = 1.0;
+    const float3 l = gLight.sunDir.xyz;
+    const float3 lt = float3(dot(l, T), dot(l, B), dot(l, N));
+    if (lt.z > 0.02) {
+        const float reach = min((kSpomDepth - q.z) / lt.z, 1.0);
+        [unroll] for (int s = 1; s <= 4; ++s)
+            if (SpomSolid(q + lt * (reach * s * 0.25 + 0.02), size)) { shade = 0.45; break; }
+    }
+    const float cloudSun = CloudSun(wp);
+    float share;
+    const float3 lit = LitPbr(pow(saturate(albedo.rgb), 2.2), n, wp, gPixelShadow * cloudSun * shade, 0.7, 0.0, cloudSun, share);
+    return float4(lit, 0.76 + 0.23 * share);
+}
+
+// Ground support vehicles ("SPOM hull", alpha 6..9, src/fly/gse.h): a low-poly shell of the big masses plus SPOM for the rest.
+// The vehicle's shape lives in textures baked on the CPU at startup from its primitive list: per axis view, two solid intervals per
+// texel along that axis (the side view's across the width, the top view's in height, the front view's in length). A point is solid
+// where all three views agree (a two-layer visual hull), so a wheel, a railing or a stair tread has a true outline and parallax.
+// Three kinds of triangles, by alpha band:
+//   7  shell      the low-poly mesh, never inside the true shape. Its pixel is the surface where the hull is solid just under it
+//                 (flat faces); else it marches on along the eye ray to the true surface (a rounded edge, a window recess, the
+//                 tyre in an arch) and discards if there is none.
+//   8  detail     a proxy box round SPOM parts: marches from the eye through the whole vehicle; a first hit on a surface the shell
+//                 owns (flag in the bake) is discarded, so the shell shows there and parts behind the body stay hidden.
+//   6  card       far away: the whole vehicle from one camera-facing card, everything marched.
+//   vertex     color.rgb its box-space position (metres from the box's min corner: x length, y up, z width), color.a = band +
+//              (density code + height / 16) / 8 with 16 (code + 1) texels per metre (length and width then follow from the texture
+//              size), uv = the vehicle's two livery colours (7 bits a channel, packed), normal = its forward axis (box x) in the world.
+//   livery     normal-map alpha >= 128: livery paint, baked white: slot (primary / secondary) in bits 5-6, clean-paint coverage in
+//              the low 5 bits. The albedo is multiplied by the slot's colour where the paint is clean, so dirt stays dirt.
+//   textures   one layout for all three, six slots: row 0 [Z+ (L x H) | Z- (L x H) | X+ (W x H) | X- (W x H)], row 1 [Y+ (L x W) |
+//              Y- (L x W)], kHullGutter texels round each. Slot (axis, sign) holds what is seen from that side (its first surface).
+//              albedo: rgb colour, a roughness. normal: rgb the box-space normal, a metalness. shape (gSurface): the + slot of an axis
+//              holds its intervals (start1, end1, start2, end2 as a fraction of the box along that axis; empty = start > end), the
+//              - slot its occlusion and glow (r AO seen from +, g AO from -, b from +, a from -: 128 if the shell owns that
+//              surface, plus glow * 127).
+// Not written: depth (the proxy's own). The shadow pass draws a coarse proxy of the bigger parts (gse.h ShadowMesh).
+static const float kHullGutter = 4.0;
+static float3 sHull;     // box size, metres: length (x), height (y), width (z)
+static float sHullD;     // texels per metre
+static float2 sHullDim;  // texture size
+float2 HullSlotPx(int slot) {
+    const float L = sHull.x * sHullD, H = sHull.y * sHullD, W = sHull.z * sHullD, G = kHullGutter;
+    return slot == 0 ? float2(G, G) : slot == 1 ? float2(3.0 * G + L, G) : slot == 2 ? float2(5.0 * G + 2.0 * L, G)
+         : slot == 3 ? float2(7.0 * G + 2.0 * L + W, G) : slot == 4 ? float2(G, 3.0 * G + H) : float2(3.0 * G + L, 3.0 * G + H);
+}
+// axis 0 is the side view (looks along z), 1 the front view (along x), 2 the top view (along y)
+float2 HullSlotSize(int axis) { return axis == 0 ? sHull.xy : axis == 1 ? sHull.zy : sHull.xz; }
+float2 HullST(int axis, float3 q) { return axis == 0 ? float2(q.x, sHull.y - q.y) : axis == 1 ? float2(q.z, sHull.y - q.y) : float2(q.x, q.z); }
+float HullDepth(int axis) { return axis == 0 ? sHull.z : axis == 1 ? sHull.x : sHull.y; }
+float HullAlong(int axis, float3 q) { return axis == 0 ? q.z : axis == 1 ? q.x : q.y; }
+float4 HullShape(int axis, float2 st) { // texel centre, level 0: blending a texel's interval with its empty neighbour invents solid
+    const float2 n = HullSlotSize(axis) * sHullD;
+    const float2 px = HullSlotPx(axis * 2) + clamp(floor(st * sHullD), 0.0, n - 1.0) + 0.5;
+    return gSurface.SampleLevel(gTexSampler, px / sHullDim, 0.0) * HullDepth(axis);
+}
+bool HullIn(float4 r, float v) { return (v >= r.x && v <= r.y) || (v >= r.z && v <= r.w); }
+bool HullSolid(float3 q) {
+    if (any(q < 0.0) || any(q > sHull)) return false;
+    if (!HullIn(HullShape(0, HullST(0, q)), q.z)) return false; // the side profile rejects most of the box
+    if (!HullIn(HullShape(2, HullST(2, q)), q.y)) return false;
+    return HullIn(HullShape(1, HullST(1, q)), q.x);
+}
+// The surface a side's bake saw at q's texel: the far end of the last interval from +, the start of the first from -.
+float HullEdge(int axis, float3 q, float s) {
+    const float4 r = HullShape(axis, HullST(axis, q));
+    return s > 0.0 ? (r.w >= r.z ? max(r.w, r.y) : r.y) : r.x;
+}
+float4 HullExtra(int axis, float3 q) { // nearest texel of an axis' occlusion / ownership slot
+    const float2 n = HullSlotSize(axis) * sHullD;
+    const float2 px = HullSlotPx(axis * 2 + 1) + clamp(floor(HullST(axis, q) * sHullD), 0.0, n - 1.0) + 0.5;
+    return gSurface.SampleLevel(gTexSampler, px / sHullDim, 0.0);
+}
+float4 GseHullPS(VSOut i) {
+    const float band = floor(i.color.a);
+    const float fcode = (i.color.a - band) * 8.0, dcode = floor(fcode);
+    gAlbedo.GetDimensions(sHullDim.x, sHullDim.y);
+    sHullD = 16.0 * (dcode + 1.0);
+    const float hullH = (fcode - dcode) * 16.0;
+    const float hullW = (sHullDim.y - 4.0 * kHullGutter) / sHullD - hullH;
+    sHull = float3((sHullDim.x - 8.0 * kHullGutter) / (2.0 * sHullD) - hullW, hullH, hullW);
+    const float footprint = max(length(ddx(i.worldPos)), length(ddy(i.worldPos))); // metres per pixel on the proxy
+    const float3 X = normalize(i.normal), Y = float3(0.0, 1.0, 0.0), Z = normalize(cross(X, Y));
+    const float3 eye = gLight.eye.xyz;
+    const float3 toP = i.worldPos - eye;
+    const float lenP = length(toP);
+    const float3 vw = toP / lenP;
+    const float3 d = float3(dot(vw, X), dot(vw, Y), dot(vw, Z)); // the view ray in box space (metric, so t stays metres)
+    const float3 e = i.color.rgb - d * lenP;                     // the eye in box space
+    const float3 sd = float3(abs(d.x) > 1e-6 ? d.x : 1e-6, abs(d.y) > 1e-6 ? d.y : 1e-6, abs(d.z) > 1e-6 ? d.z : 1e-6);
+    const float3 ta = -e / sd, tb = (sHull - e) / sd;
+    const float3 tmin = min(ta, tb), tmax = max(ta, tb);
+    float tIn = max(max(max(tmin.x, tmin.y), tmin.z), 0.0);
+    const float tOut = min(min(tmax.x, tmax.y), tmax.z);
+    const bool shell = band > 6.5 && band < 7.5;
+    float3 nf = float3(0.0, 0.0, 0.0); // the shell's face normal, box space, toward the eye
+    bool onShell = false;
+    if (shell) {
+        nf = normalize(cross(ddx(i.color.rgb), ddy(i.color.rgb)) + float3(0.0, 1e-7, 0.0));
+        if (dot(nf, d) > 0.0) nf = -nf;
+        tIn = lenP;
+        onShell = HullSolid(i.color.rgb - nf * 0.008); // a flat face of the true shape: no march
+    }
+    if (tOut <= tIn && !onShell) discard;
+    float tLo = tIn, tHi = tIn, dt = 0.01;
+    if (!onShell) {
+        // Linear search, about a pixel a step (1.5 cm at least; 320 steps at most), then bisection.
+        const float span = tOut - tIn;
+        const int steps = (int)clamp(ceil(span / clamp(footprint * 0.75, 0.015, 0.3)), 8.0, 320.0);
+        dt = span / steps;
+        bool hit = false;
+        [loop] for (int k = 0; k <= steps; ++k) {
+            tHi = tIn + dt * k;
+            if (HullSolid(e + d * tHi)) { hit = true; break; }
+            tLo = tHi;
+        }
+        if (!hit) discard;
+        [unroll] for (int r = 0; r < 7; ++r) {
+            const float tm = 0.5 * (tLo + tHi);
+            if (HullSolid(e + d * tm)) tHi = tm; else tLo = tm;
+        }
+    }
+    const float3 q = e + d * tHi, qo = e + d * tLo;
+    // Which side's bake colours the hit. First choice: the axis whose interval END the ray crossed (it missed that view's interval
+    // just before the hit, at the same texel), so the surface faces along it; then the other axes, most face-on first. A side is
+    // taken when its first surface at this texel is the hit itself (else the hit is hidden from that side: a wheel behind a step).
+    const bool fromBox = any(qo < 0.0) || any(qo > sHull) || (tHi - tIn < 1e-4 && !shell);
+    int axisEnd = -1;
+    if (onShell) axisEnd = abs(nf.z) >= abs(nf.x) && abs(nf.z) >= abs(nf.y) ? 0 : (abs(nf.x) >= abs(nf.y) ? 1 : 2);
+    else if (fromBox) axisEnd = tmin.z >= tmin.x && tmin.z >= tmin.y ? 0 : (tmin.x >= tmin.y ? 1 : 2);
+    else {
+        [unroll] for (int a = 0; a < 3; ++a)
+            if (axisEnd < 0 && !HullIn(HullShape(a, HullST(a, q)), HullAlong(a, qo))) axisEnd = a;
+    }
+    const float3 ad = abs(float3(d.z, d.x, d.y)); // |d| per axis index
+    int order[3] = {0, 1, 2};
+    float pri[3] = {ad.x + (axisEnd == 0 ? 10.0 : 0.0), ad.y + (axisEnd == 1 ? 10.0 : 0.0), ad.z + (axisEnd == 2 ? 10.0 : 0.0)};
+    [unroll] for (int s0 = 0; s0 < 2; ++s0) [unroll] for (int s1 = 0; s1 < 2 - s0; ++s1)
+        if (pri[order[s1]] < pri[order[s1 + 1]]) { const int t = order[s1]; order[s1] = order[s1 + 1]; order[s1 + 1] = t; }
+    int axis = order[0];
+    [unroll] for (int c = 2; c >= 0; --c) {
+        const int a = order[c];
+        const float s = (a == 0 ? d.z : a == 1 ? d.x : d.y) > 0.0 ? -1.0 : 1.0; // the side facing the eye
+        const float tol = HullDepth(a) * (2.5 / 255.0) + dt * 1.5 + 0.02;
+        if (abs(HullAlong(a, q) - HullEdge(a, q, s)) < tol) axis = a;
+    }
+    const float sgn = (axis == 0 ? d.z : axis == 1 ? d.x : d.y) > 0.0 ? -1.0 : 1.0;
+    const int slot = axis * 2 + (sgn > 0.0 ? 0 : 1);
+    const float2 n2 = HullSlotSize(axis) * sHullD;
+    const float2 at = (HullSlotPx(slot) + clamp(HullST(axis, q) * sHullD, 0.5, n2 - 0.5)) / sHullDim;
+    const float lod = clamp(log2(max(footprint * sHullD, 1e-4)), 0.0, 2.0);
+    const float4 alb = gAlbedo.SampleLevel(gTexSampler, at, lod);
+    const float4 nrm = gNormalMap.SampleLevel(gTexSampler, at, lod);
+    const float4 extra = HullExtra(axis, q);
+    const float ao = sgn > 0.0 ? extra.r : extra.g;
+    const float tag = (sgn > 0.0 ? extra.b : extra.a) * 255.0;
+    const bool owned = tag > 127.5;
+    if (band > 7.5 && owned) discard; // a detail proxy over the shell's own surface
+    const float glow = (owned ? tag - 128.0 : tag) / 127.0;
+    const float3 nb = normalize(nrm.xyz * 2.0 - 1.0 + float3(0.0, 1e-4, 0.0));
+    const float3 n = normalize(X * nb.x + Y * nb.y + Z * nb.z);
+    const float3 wp = eye + vw * tHi;
+    // Its own shadow, through the hull toward the sun: rails on the deck, the boom on the chassis, the canopy on the stair.
+    float self = 1.0;
+    const float3 l = gLight.sunDir.xyz;
+    const float3 lt = float3(dot(l, X), l.y, dot(l, Z));
+    if (dot(n, l) > 0.0) {
+        float s = 0.04;
+        [loop] for (int k = 0; k < 12; ++k) {
+            if (HullSolid(q + nb * 0.02 + lt * s)) { self = 0.0; break; }
+            s *= 1.38;
+        }
+    }
+    const float grazing = 1.0 - saturate(dot(n, l));
+    const float3 shadowPos = mul(gLight.shadowVP, float4(wp + n * (gLight.shadowParams.z * (1.0 + 2.0 * grazing)), 1.0)).xyz;
+    const float3 tightPos = mul(gLight.tightVP, float4(wp + n * (gLight.tightParams.z * (1.0 + 2.0 * grazing)), 1.0)).xyz;
+    gTightSoft = 1.0;
+    gPixelShadow = ShadowFactor(shadowPos, tightPos);
+    gMatAO = ao;
+    // livery: the normal map's alpha at this texel (nearest; it is a code, not a value to blend)
+    const float2 mpx = HullSlotPx(slot) + clamp(floor(HullST(axis, q) * sHullD), 0.0, n2 - 1.0) + 0.5;
+    const float code = round(gNormalMap.SampleLevel(gTexSampler, mpx / sHullDim, 0.0).a * 255.0);
+    float metal = nrm.a * (255.0 / 127.0);
+    float3 base = alb.rgb;
+    if (code > 127.5) {
+        const float ls = floor((code - 128.0) / 32.0), cover = (code - 128.0 - ls * 32.0) / 31.0;
+        const uint pk = (uint)round(ls < 0.5 ? i.uv.x : i.uv.y);
+        const float3 tint = float3((pk >> 14) & 127u, (pk >> 7) & 127u, pk & 127u) / 127.0;
+        const float l = dot(tint, float3(0.299, 0.587, 0.114));
+        base *= lerp(float3(1.0, 1.0, 1.0), lerp(tint, float3(l, l, l), 0.1), cover);
+        metal = 0.0;
+    }
+    metal = saturate(metal);
+    const float rough = clamp(alb.a, 0.03, 1.0);
+    const float3 albedoLinear = pow(saturate(base), 2.2) * lerp(0.55, 1.0, ao); // crevices hold dirt and miss the sky
+    const float cloudSun = CloudSun(wp);
+    float share;
+    float3 lit = LitPbr(albedoLinear, n, wp, gPixelShadow * cloudSun * self, rough, metal, cloudSun, share);
+    lit += pow(saturate(base), 2.2) * (glow * glow * kEmissiveScale);
+    const float shareAlpha = 0.76 + 0.23 * share;
+    return float4(lit, rough < 0.35 ? -shareAlpha : shareAlpha);
+}
+
+// Railway track ("SPOM track", alpha 0.83): every track is a thin box (top + two sides, no culling) swept along the line; each pixel
+// marches the eye ray through the box against the baked track height field (assets/rail/track/tex, height in albedo.a) and discards
+// on a miss, so rails, sleepers and the ballast shoulder make the silhouette. Same scheme as assets/rail/preview.html.
+//   normal     the track's forward direction (horizontal unit); across = cross(up, forward)
+//   uv         metres across the track from its centre line, metres along it
+//   color.r    this vertex's height relative to the rail top (0 .. -kTrackDepth), color.g the box width
+// Back faces (no culling) step back to where the ray entered, so either face finds the same hit; the nearer face wins the depth test.
+static const float kTrackDepth = 0.55, kTrackSleeper = 0.6;
+float TrackH(float3 p, float W) { return -kTrackDepth + kTrackDepth * gAlbedo.SampleLevel(gTexSampler, float2((p.x + 0.5 * W) / W, p.z / kTrackSleeper), 0.0).a; }
+float4 TrackPS(VSOut i) {
+    const float3 F = normalize(float3(i.normal.x, 0.0, i.normal.z));
+    const float3 X = float3(F.z, 0.0, -F.x);
+    const float W = max(i.color.g, 1.0), hw = 0.5 * W;
+    const float3 vw = normalize(i.worldPos - gLight.eye.xyz);
+    const float3 d = float3(dot(vw, X), vw.y, dot(vw, F));
+    float3 p0 = float3(i.uv.x, i.color.r, i.uv.y);
+    const float camDist = length(i.worldPos - gLight.eye.xyz);
+    const float2 uvIn = float2((i.uv.x + hw) / W, i.uv.y / kTrackSleeper);
+    float t = 0.0, tBack = 0.0;
+    bool hit = true;
+    if (camDist < 160.0) { // far away the relief is under a pixel: shade the box top flat
+        float2 tb = float2(1e9, 1e9);
+        if (abs(d.x) > 1e-5) tb.x = d.x > 0.0 ? (p0.x + hw) / d.x : (p0.x - hw) / d.x;
+        if (abs(d.y) > 1e-5) tb.y = d.y > 0.0 ? (p0.y + kTrackDepth) / d.y : p0.y / d.y;
+        tBack = max(min(tb.x, tb.y), 0.0);
+        p0 -= d * tBack;
+        float2 tf = float2(1e9, 1e9);
+        if (abs(d.x) > 1e-5) tf.x = d.x > 0.0 ? (hw - p0.x) / d.x : (-hw - p0.x) / d.x;
+        if (abs(d.y) > 1e-5) tf.y = d.y > 0.0 ? -p0.y / d.y : (-kTrackDepth - p0.y) / d.y;
+        const float tExit = max(min(tf.x, tf.y), 0.0);
+        const int steps = 40;
+        const float dt = tExit / steps;
+        float tLo = 0.0, tHi = 0.0;
+        hit = false;
+        [loop] for (int k = 0; k <= steps; ++k) {
+            tHi = dt * k;
+            const float3 q = p0 + d * tHi;
+            if (q.y <= TrackH(q, W)) { hit = true; break; }
+            tLo = tHi;
+        }
+        if (!hit) discard;
+        [unroll] for (int r = 0; r < 5; ++r) {
+            const float tm = 0.5 * (tLo + tHi);
+            const float3 q = p0 + d * tm;
+            if (q.y <= TrackH(q, W)) tHi = tm; else tLo = tm;
+        }
+        t = tHi;
+    }
+    const float3 q = p0 + d * t;
+    const float2 uv = float2((q.x + hw) / W, q.z / kTrackSleeper);
+    const float3 albedo = camDist < 160.0 ? gAlbedo.SampleLevel(gTexSampler, uv, 0.0).rgb : gAlbedo.Sample(gTexSampler, uvIn).rgb;
+    float3 nl = float3(0, 1, 0);
+    if (camDist < 160.0) {
+        const float e = 0.01, h0 = TrackH(q, W);
+        nl = normalize(float3(-(TrackH(q + float3(e, 0, 0), W) - TrackH(q - float3(e, 0, 0), W)) / (2.0 * e), 1.0,
+                              -(TrackH(q + float3(0, 0, e), W) - TrackH(q - float3(0, 0, e), W)) / (2.0 * e)));
+        if (q.y < h0 - 0.003) nl = abs(d.x) > abs(d.z) ? float3(-sign(d.x), 0, 0) : float3(0, 0, -sign(d.z)); // entered through a side
+    }
+    const float3 n = normalize(X * nl.x + float3(0, nl.y, 0) + F * nl.z);
+    const float3 wp = i.worldPos + vw * (t - tBack);
+    float shade = 1.0;
+    if (camDist < 160.0) {
+        const float3 l = gLight.sunDir.xyz, lt = float3(dot(l, X), l.y, dot(l, F));
+        if (lt.y > 0.02) [unroll] for (int s = 1; s <= 6; ++s) { const float3 sp = q + lt * (s * 0.06 + 0.004); if (sp.y <= TrackH(sp, W)) { shade = 0.4; break; } }
+    }
+    const float steel = smoothstep(0.55, 0.85, albedo.g);
+    const float cloudSun = CloudSun(wp);
+    float share;
+    const float3 lit = LitPbr(pow(saturate(albedo), 2.2), n, wp, gPixelShadow * cloudSun * shade, lerp(0.85, 0.35, steel), steel * 0.8, cloudSun, share);
+    return float4(lit, 0.76 + 0.23 * share);
+}
+
+// Rail junction ("SPOM junction", alpha 0.84, src/city/rail_junction_plane.h): the track's flat box and march, but the texture
+// (assets/rail/junction/tex: one baked layout, height in alpha) spans the box once instead of repeating. Height byte 0 is a
+// hole: no surface there, the ray passes and the pixel is discarded (the terrain shows through). Same settings as TrackPS.
+//   normal     the layout's forward (+x, along the stem); its canonical +z (across) is (-F.z, 0, F.x) * sign(color.g)
+//   uv         metres across from the box's z0 edge (0 .. W) and along from its x0 edge (0 .. L), canonical (unmirrored)
+//   color.r    this vertex's height relative to the rail top, color.g the width W (negative: a mirrored, left-hand layout),
+//   color.b    the length L
+float JunctionH(float3 p, float2 size, float2 halfTexel) { // p = (across, y, along); -1e9 in a hole
+    const float2 uv = clamp(float2(p.x / size.x, p.z / size.y), halfTexel, 1.0 - halfTexel);
+    const float h = gAlbedo.SampleLevel(gTexSampler, uv, 0.0).a;
+    return h < 0.5 / 255.0 ? -1e9 : -kTrackDepth + kTrackDepth * h;
+}
+float JunctionHN(float3 p, float2 size, float2 halfTexel, float fallback) { // for gradients: a hole reads as the centre
+    const float h = JunctionH(p, size, halfTexel);
+    return h < -1.0 ? fallback : h;
+}
+float4 JunctionPS(VSOut i) {
+    const float3 F = normalize(float3(i.normal.x, 0.0, i.normal.z));
+    const float m = i.color.g < 0.0 ? -1.0 : 1.0;
+    const float3 Z = float3(-F.z, 0.0, F.x) * m;
+    const float2 size = float2(max(abs(i.color.g), 0.5), max(i.color.b, 0.5));
+    float2 dim;
+    gAlbedo.GetDimensions(dim.x, dim.y);
+    const float2 halfTexel = 0.5 / max(dim, float2(1.0, 1.0));
+    const float3 vw = normalize(i.worldPos - gLight.eye.xyz);
+    const float3 d = float3(dot(vw, Z), vw.y, dot(vw, F));
+    float3 p0 = float3(i.uv.x, i.color.r, i.uv.y);
+    const float camDist = length(i.worldPos - gLight.eye.xyz);
+    const float2 uvIn = clamp(float2(i.uv.x / size.x, i.uv.y / size.y), halfTexel, 1.0 - halfTexel);
+    float t = 0.0, tBack = 0.0;
+    if (camDist < 160.0) {
+        float3 tb = float3(1e9, 1e9, 1e9); // back to where the ray entered the box (this may be a back face)
+        if (abs(d.x) > 1e-5) tb.x = d.x > 0.0 ? p0.x / d.x : (p0.x - size.x) / d.x;
+        if (abs(d.y) > 1e-5) tb.y = d.y > 0.0 ? (p0.y + kTrackDepth) / d.y : p0.y / d.y;
+        if (abs(d.z) > 1e-5) tb.z = d.z > 0.0 ? p0.z / d.z : (p0.z - size.y) / d.z;
+        tBack = max(min(tb.x, min(tb.y, tb.z)), 0.0);
+        p0 -= d * tBack;
+        // (Where the plain track meets the box it has an end cap, road_network.h TrackCap: a ray that leaves this box
+        // there below the plain box's top meets the cap, and TrackPS marches it from where it entered.)
+        float3 tf = float3(1e9, 1e9, 1e9);
+        if (abs(d.x) > 1e-5) tf.x = d.x > 0.0 ? (size.x - p0.x) / d.x : -p0.x / d.x;
+        if (abs(d.y) > 1e-5) tf.y = d.y > 0.0 ? -p0.y / d.y : (-kTrackDepth - p0.y) / d.y;
+        if (abs(d.z) > 1e-5) tf.z = d.z > 0.0 ? (size.y - p0.z) / d.z : -p0.z / d.z;
+        const float tExit = max(min(tf.x, min(tf.y, tf.z)), 0.0);
+        const int steps = 40;
+        const float dt = tExit / steps;
+        float tLo = 0.0, tHi = 0.0;
+        bool hit = false;
+        [loop] for (int k = 0; k <= steps; ++k) {
+            tHi = dt * k;
+            const float3 q = p0 + d * tHi;
+            if (q.y <= JunctionH(q, size, halfTexel)) { hit = true; break; }
+            tLo = tHi;
+        }
+        if (!hit) discard;
+        [unroll] for (int r = 0; r < 5; ++r) {
+            const float tm = 0.5 * (tLo + tHi);
+            const float3 q = p0 + d * tm;
+            if (q.y <= JunctionH(q, size, halfTexel)) tHi = tm; else tLo = tm;
+        }
+        t = tHi;
+    } else if (gAlbedo.Sample(gTexSampler, uvIn).a < 0.1) discard; // far: the box top, flat, with its holes
+    const float3 q = p0 + d * t;
+    const float2 uv = clamp(float2(q.x / size.x, q.z / size.y), halfTexel, 1.0 - halfTexel);
+    const float3 albedo = camDist < 160.0 ? gAlbedo.SampleLevel(gTexSampler, uv, 0.0).rgb : gAlbedo.Sample(gTexSampler, uvIn).rgb;
+    float3 nl = float3(0, 1, 0);
+    if (camDist < 160.0) {
+        const float e = 0.02, h0 = JunctionHN(q, size, halfTexel, q.y);
+        nl = normalize(float3(-(JunctionHN(q + float3(e, 0, 0), size, halfTexel, h0) - JunctionHN(q - float3(e, 0, 0), size, halfTexel, h0)) / (2.0 * e), 1.0,
+                              -(JunctionHN(q + float3(0, 0, e), size, halfTexel, h0) - JunctionHN(q - float3(0, 0, e), size, halfTexel, h0)) / (2.0 * e)));
+        if (q.y < h0 - 0.003) nl = abs(d.x) > abs(d.z) ? float3(-sign(d.x), 0, 0) : float3(0, 0, -sign(d.z)); // entered through a side
+    }
+    const float3 n = normalize(Z * nl.x + float3(0, nl.y, 0) + F * nl.z);
+    const float3 wp = i.worldPos + vw * (t - tBack);
+    float shade = 1.0;
+    if (camDist < 160.0) {
+        const float3 l = gLight.sunDir.xyz, lt = float3(dot(l, Z), l.y, dot(l, F));
+        if (lt.y > 0.02) [unroll] for (int s = 1; s <= 6; ++s) { const float3 sp = q + lt * (s * 0.06 + 0.004); if (sp.y <= JunctionH(sp, size, halfTexel)) { shade = 0.4; break; } }
+    }
+    const float steel = smoothstep(0.55, 0.85, albedo.g);
+    const float cloudSun = CloudSun(wp);
+    float share;
+    const float3 lit = LitPbr(pow(saturate(albedo), 2.2), n, wp, gPixelShadow * cloudSun * shade, lerp(0.85, 0.35, steel), steel * 0.8, cloudSun, share);
+    return float4(lit, 0.76 + 0.23 * share);
+}
+
+// SPOM slabs (alpha 0.806 .. 0.824): a whole building face as one thin box kSlabDepth deep standing out of the face; each pixel
+// marches the eye ray against the relief in gAlbedo.a (height out of the face, 0..1 of the depth) so pilasters, recessed windows,
+// brick, door portals, skylights and parapets are real silhouettes from a handful of triangles (tools/building_gen/depot_tex.py).
+// Alpha below 0.815: a wall (out = (-T.z, 0, T.x), up the face = world up); above: a roof (out = up, across = (T.z, 0, -T.x)).
+//   normal    T, the horizontal direction along the face (the texture repeats along it)
+//   uv        metres along T and across the face (up a wall, across a roof); color.r this vertex's height out of the face
+//   color.g   the texture's repeat along T (metres), color.b the face's extent across (metres, the texture spans it once)
+// Back faces (no culling) step back to where the ray entered, so either face of the slab finds the same hit.
+static const float kSlabDepth = 0.8;
+float SlabH(float2 m, float2 size, bool roof) {
+    const float2 uv = float2(m.x / size.x, roof ? m.y / size.y : 1.0 - m.y / size.y);
+    return kSlabDepth * gAlbedo.SampleLevel(gTexSampler, uv, 0.0).a;
+}
+float4 SlabPS(VSOut i) {
+    const bool roof = i.color.a > 0.815;
+    const float3 T = normalize(float3(i.normal.x, 0.0, i.normal.z));
+    const float3 N = roof ? float3(0, 1, 0) : float3(-T.z, 0.0, T.x);
+    const float3 B = roof ? float3(T.z, 0.0, -T.x) : float3(0, 1, 0);
+    const float2 size = max(i.color.gb, 0.1);
+    const float3 vw = normalize(i.worldPos - gLight.eye.xyz);
+    const float3 d = float3(dot(vw, T), dot(vw, B), dot(vw, N));
+    float3 p0 = float3(i.uv, i.color.r);
+    const float camDist = length(i.worldPos - gLight.eye.xyz);
+    const bool near = camDist < 260.0;
+    float t = 0.0, tBack = 0.0;
+    if (near) {
+        float2 tb = float2(1e9, 1e9); // back to where the ray entered the slab (across: [0, extent], out: [0, depth])
+        if (abs(d.y) > 1e-5) tb.x = d.y > 0.0 ? p0.y / d.y : (p0.y - size.y) / d.y;
+        if (abs(d.z) > 1e-5) tb.y = d.z > 0.0 ? p0.z / d.z : (p0.z - kSlabDepth) / d.z;
+        tBack = max(min(tb.x, tb.y), 0.0);
+        p0 -= d * tBack;
+        float2 tf = float2(1e9, 1e9);
+        if (abs(d.y) > 1e-5) tf.x = d.y > 0.0 ? (size.y - p0.y) / d.y : -p0.y / d.y;
+        if (abs(d.z) > 1e-5) tf.y = d.z > 0.0 ? (kSlabDepth - p0.z) / d.z : -p0.z / d.z;
+        const float tExit = max(min(tf.x, tf.y), 0.0);
+        const int steps = clamp((int)ceil(tExit / 0.03), 16, 64);
+        const float dt = tExit / steps;
+        float tLo = 0.0, tHi = 0.0;
+        bool hit = false;
+        [loop] for (int k = 0; k <= steps; ++k) {
+            tHi = dt * k;
+            const float3 q = p0 + d * tHi;
+            if (q.z <= SlabH(q.xy, size, roof)) { hit = true; break; }
+            tLo = tHi;
+        }
+        // the face's own plane (height 0) is always solid: a ray leaving through the back has hit it, however the samples fell
+        const bool outBack = d.z < 0.0 && tf.y <= tf.x + 1e-4;
+        if (!hit && !outBack) discard;
+        if (!hit) tLo = tHi = tExit;
+        [unroll] for (int r = 0; r < 5; ++r) {
+            const float tm = 0.5 * (tLo + tHi);
+            const float3 q = p0 + d * tm;
+            if (q.z <= SlabH(q.xy, size, roof)) tHi = tm; else tLo = tm;
+        }
+        t = tHi;
+    }
+    const float3 q = p0 + d * t;
+    const float2 uv = float2(q.x / size.x, roof ? q.y / size.y : 1.0 - q.y / size.y);
+    const float2 uvIn = float2(i.uv.x / size.x, roof ? i.uv.y / size.y : 1.0 - i.uv.y / size.y);
+    const float3 albedo = near ? gAlbedo.SampleLevel(gTexSampler, uv, 0.0).rgb : gAlbedo.Sample(gTexSampler, uvIn).rgb;
+    float3 nl = float3(0, 0, 1);
+    if (near) {
+        const float e = 0.02, h0 = SlabH(q.xy, size, roof);
+        nl = normalize(float3(-(SlabH(q.xy + float2(e, 0), size, roof) - SlabH(q.xy - float2(e, 0), size, roof)) / (2.0 * e),
+                              -(SlabH(q.xy + float2(0, e), size, roof) - SlabH(q.xy - float2(0, e), size, roof)) / (2.0 * e), 1.0));
+        if (q.z < h0 - 0.004) nl = abs(d.x) > abs(d.y) ? float3(-sign(d.x), 0, 0) : float3(0, -sign(d.y), 0); // a step's side
+    }
+    const float3 n = normalize(T * nl.x + B * nl.y + N * nl.z);
+    const float3 wp = i.worldPos + vw * (t - tBack);
+    float shade = 1.0;
+    if (near) { // its own shadow: toward the sun through the relief
+        const float3 l = gLight.sunDir.xyz, lt = float3(dot(l, T), dot(l, B), dot(l, N));
+        if (lt.z > 0.02) {
+            const float reach = min((kSlabDepth - q.z) / lt.z, 3.0);
+            [unroll] for (int s = 1; s <= 6; ++s) { const float3 sp = q + lt * (reach * s / 6.0 + 0.005); if (sp.z <= SlabH(sp.xy, size, roof)) { shade = 0.4; break; } }
+        }
+    }
+    const float glass = saturate((0.25 - dot(albedo, float3(0.3, 0.5, 0.2))) * 6.0) * step(q.z, 0.06); // the dark panes sit at the back
+    const float cloudSun = CloudSun(wp);
+    float share;
+    const float3 lit = LitPbr(pow(saturate(albedo), 2.2), n, wp, gPixelShadow * cloudSun * shade, lerp(0.8, 0.12, glass), glass * 0.6, cloudSun, share);
+    return float4(lit, 0.76 + 0.23 * share);
+}
+
+// Building windows (alpha 0.665, material name contains "roomglass"; tools/building_gen/roomglass.py): a room behind every pane by
+// interior mapping (van Dongen, "Interior Mapping", 2008), under smooth scratched glass. Unlike GlassPS the room is drawn, so the pane
+// is opaque and needs nothing behind it.
+//   uv          metres across the window plane (along T = cross(up, N)) and up it, from the plane's origin
+//   color.rgb   one room's width and height in metres, and a seed; rooms repeat along the plane (a facade's bays and storeys, or a
+//               single window's own size)
+//   gAlbedo     a 4x4 atlas of back walls seen straight on (sRGB): furnishings, curtains, blinds; one per room, chosen by hash
+//   gNormalMap  R: a wear mask (scratches, drips, grime), tiled in metres; brighter = dirtier
+float4 RoomGlassPS(VSOut i) {
+    const float3 v = normalize(gLight.eye.xyz - i.worldPos);
+    const float3 N = normalize(i.normal);
+    const float3 B = float3(0.0, 1.0, 0.0);
+    const float3 T = normalize(cross(B, N));
+    const float2 cell = max(i.color.rg, 0.3);
+    const float seed = i.color.b;
+    const float2 ci = floor(i.uv / cell);
+    const float2 f = i.uv / cell - ci;                            // where in its room the pixel's pane is, 0..1
+    const float depth = clamp(cell.x * 1.2, 2.5, 5.0);
+    // The ray into the room, in room units: x across, y up, z inward (0 at the glass, 1 at the back wall).
+    const float3 d = -v;
+    float3 rd = float3(dot(d, T) / cell.x, dot(d, B) / cell.y, max(-dot(d, N), 1e-3) / depth);
+    const float3 ro = float3(f, 0.0);
+    const float tx = rd.x > 1e-5 ? (1.0 - ro.x) / rd.x : (rd.x < -1e-5 ? -ro.x / rd.x : 1e9);
+    const float ty = rd.y > 1e-5 ? (1.0 - ro.y) / rd.y : (rd.y < -1e-5 ? -ro.y / rd.y : 1e9);
+    const float tz = 1.0 / rd.z;
+    const float t = min(tz, min(tx, ty));
+    const float3 h = ro + rd * t;
+    const float pick = TileHash(ci * float2(1.37, 2.71) + seed * 17.3);
+    const float k = floor(pick * 16.0);
+    const float2 atlas0 = float2(fmod(k, 4.0), floor(k / 4.0)) * 0.25;
+    const float3 wallAvg = pow(saturate(gAlbedo.SampleLevel(gTexSampler, atlas0 + 0.125, 5.0).rgb), 2.2);
+    float3 room;
+    if (t == tz) {                                                // the back wall: this room's picture
+        const float2 auv = atlas0 + float2(clamp(h.x, 0.01, 0.99), clamp(1.0 - h.y, 0.01, 0.99)) * 0.25;
+        room = pow(saturate(gAlbedo.SampleLevel(gTexSampler, auv, 0.0).rgb), 2.2);
+    } else if (t == ty) {                                         // floor or ceiling
+        room = rd.y < 0.0 ? wallAvg * float3(0.62, 0.5, 0.4) * (0.85 + 0.15 * TileNoise(float2(h.x * 9.0, h.z * 3.0)))
+                          : float3(0.55, 0.54, 0.52) * (0.7 + 0.3 * h.z);
+    } else {                                                      // a side wall
+        room = wallAvg * 0.78 * (0.75 + 0.25 * h.z);
+    }
+    room *= lerp(1.0, 0.55, saturate(h.z));                       // light falls off toward the back
+    float skyVis;
+    const float3 ambientIn = IndirectDiffuse(i.worldPos, N, skyVis);
+    const float lit = step(0.9, TileHash(ci * float2(3.1, 5.7) + seed * 9.1));
+    const float3 lamp = float3(1.0, 0.78, 0.5) * lit * 0.9;
+    room *= ambientIn * 0.55 + lamp;
+    // The glass: Fresnel sky, the sun's glint, and wear from the mask (mirrored tiling, 1.2 m per repeat, shifted per room).
+    const float nv = saturate(dot(N, v));
+    const float F = 0.04 + 0.96 * pow(1.0 - nv, 5.0);
+    const float2 wuv = abs(frac((i.uv / 1.2 + pick * float2(3.7, 1.3)) * 0.5) * 2.0 - 1.0);
+    const float wear = gNormalMap.Sample(gTexSampler, wuv).r;
+    const float grime = smoothstep(0.35, 0.8, wear) * lerp(0.4, 1.0, TileHash(ci + seed));
+    const float scratch = smoothstep(0.8, 0.95, wear);
+    const float3 refl = SkyReflection(reflect(d, N), 0.04 + grime * 0.25);
+    const float3 rh = normalize(v + gLight.sunDir.xyz);
+    const float sunLit = gPixelShadow * CloudSun(i.worldPos);
+    const float glint = pow(saturate(dot(N, rh)), 1500.0) * 40.0 * sunLit * saturate(dot(N, gLight.sunDir.xyz) * 8.0);
+    const float3 dust = float3(0.42, 0.37, 0.3) * ambientIn * 0.25;
+    float3 col = room * (1.0 - F) * (1.0 - 0.45 * grime) + dust * grime * 0.6;
+    col += refl * lerp(F, saturate(F + 0.08), grime) * lerp(1.0, skyVis, 0.3);
+    col += (refl * 0.5 + gLight.sunColor.rgb * sunLit * 0.3) * scratch * 0.25;
+    col += gLight.sunColor.rgb * glint;
+    return float4(col, -0.99);                                    // negative: the composite adds screen-space reflection
+}
+
+// Vehicle interior behind glass (alpha 0.70, material name contains "interior"; tools/vehicle_gen/gen_transit.py). Interior
+// mapping after van Dongen 2008, "Interior Mapping": no geometry behind the pane, the ray is cast into an analytic saloon instead,
+// so seats, poles and the far side shift with the view like real depth.
+//   uv.x  pane index + frac across the pane (kept small: fp32 derivatives of big uvs are noise)
+//   uv.y  style * 16 + overlay variant (0..15) + frac down the pane. Width and height in metres come from the screen derivatives;
+//         the position along the vehicle comes from world space.
+//   rgb   seat fabric colour (the material's baseColorFactor)
+//   gAlbedo  4x4 atlas of glass overlays (tint, frit, blinds, curtains, vents, ad wrap, sash), alpha = coverage
+// Styles: 0 city bus, 1 coach, 2 school bus, 3 tram, 4 windshield / end window looking down the saloon.
+struct InteriorStyle { float depth, sill, top, pitch, back, poles; };
+InteriorStyle InteriorOf(int s) {
+    InteriorStyle o;
+    o.depth = 2.25; o.sill = 0.85; o.top = 0.35; o.pitch = 0.80; o.back = 1.00; o.poles = 1.0;
+    if (s == 1) { o.sill = 0.70; o.top = 0.45; o.pitch = 0.86; o.back = 1.18; o.poles = 0.0; }
+    if (s == 2) { o.depth = 2.15; o.sill = 0.70; o.top = 0.40; o.pitch = 0.90; o.back = 0.92; o.poles = 0.0; }
+    if (s == 3) { o.depth = 2.15; o.sill = 0.55; o.top = 0.50; o.pitch = 1.00; o.back = 0.95; }
+    if (s == 4) { o.depth = 9.0; o.sill = 0.80; o.top = 0.35; o.pitch = 0.85; o.poles = 0.0; } // floor 0.35 m up, windshield from 1.15 m
+    return o;
+}
+// Ray (o + d t) against a circle in 2D: first t > 0, or 1e9.
+float RayCircle(float2 o, float2 d, float2 c, float r) {
+    const float2 m = o - c;
+    const float a = dot(d, d), b = dot(m, d), cc = dot(m, m) - r * r;
+    const float disc = b * b - a * cc;
+    if (disc < 0.0 || a < 1e-8) return 1e9;
+    const float t = (-b - sqrt(disc)) / a;
+    return t > 0.0 ? t : 1e9;
+}
+float4 InteriorPS(VSOut i) {
+    const float3 N = normalize(i.normal);
+    const float3 eyeToP = normalize(i.worldPos - gLight.eye.xyz);
+    const int style = (int)floor(i.uv.y / 16.0 + 1e-4);
+    const float u = i.uv.x;
+    const int variant = clamp((int)floor(i.uv.y) - style * 16, 0, 15);
+    const float lv = frac(i.uv.y), lu = frac(u);
+    // metres per uv, by the chain rule on this pixel's derivatives (frac(v) keeps neighbouring variants from tearing the solve)
+    const float3 dp1 = ddx(i.worldPos), dp2 = ddy(i.worldPos);
+    const float2 d1 = float2(ddx(u), ddx(lv)), d2 = float2(ddy(u), ddy(lv));
+    const float det = d1.x * d2.y - d1.y * d2.x;
+    float3 dPdu = (dp1 * d2.y - dp2 * d1.y) / (abs(det) > 1e-12 ? det : 1e-12);
+    float3 dPdv = (dp2 * d1.x - dp1 * d2.x) / (abs(det) > 1e-12 ? det : 1e-12);
+    const float W = clamp(length(dPdu), 0.3, 4.0), H = clamp(length(dPdv), 0.3, 3.0);
+    const float3 T = normalize(dPdu - N * dot(dPdu, N));
+    const float3 U = normalize(cross(N, T)) * (dot(cross(N, T), -dPdv) < 0.0 ? -1.0 : 1.0); // up the pane
+    const InteriorStyle st = InteriorOf(style);
+    const bool endView = style == 4;
+    // local frame: x along the vehicle (T), y up from the window bottom, z into the vehicle
+    // along the vehicle from world space (exact); derivative-based W only scales terms within one pane, where its jitter is harmless
+    const float3 o = float3(endView ? lu * W : dot(i.worldPos - i.origin, T), (1.0 - lv) * H, 0.0);
+    const float3 d = float3(dot(eyeToP, T), dot(eyeToP, U), max(dot(eyeToP, -N), 0.02));
+    // shell
+    float tBest = (st.depth - o.z) / d.z; int hit = 0; // 0 far wall, 1 floor, 2 ceiling, 3 seat back, 4 cushion, 5 pole, 6 rack, 7 side wall
+    const float yFloor = -st.sill, yCeil = H + st.top;
+    if (d.y < 0.0) { const float t = (yFloor - o.y) / d.y; if (t < tBest) { tBest = t; hit = 1; } }
+    if (d.y > 0.0) { const float t = (yCeil - o.y) / d.y; if (t < tBest) { tBest = t; hit = 2; } }
+    if (endView) { // the pane spans the vehicle's width: its edges are the side walls
+        const float t = d.x > 0.0 ? (W - o.x) / d.x : -o.x / d.x;
+        if (abs(d.x) > 1e-4 && t > 0.0 && t < tBest) { tBest = t; hit = 7; }
+    }
+    // seats: transverse rows. Side view: back planes cross x; end view: they cross z. "a" = crossing axis, "c" = across it.
+    const float3 oa = endView ? float3(o.z, o.y, o.x) : o;
+    const float3 da = endView ? float3(d.z, d.y, d.x) : d;
+    const float span = endView ? W : st.depth;
+    const float aisle0 = span * 0.42, aisle1 = span * 0.58;
+    float3 seatN = 0; float seatFace = 0;
+    if (abs(da.x) > 1e-4) {
+        const float k0 = da.x > 0.0 ? ceil(oa.x / st.pitch) : floor(oa.x / st.pitch);
+        [loop] for (int k = 0; k < 10; ++k) {
+            const float plane = (k0 + (da.x > 0.0 ? k : -k)) * st.pitch;
+            const float t = (plane - oa.x) / da.x;
+            if (t >= tBest) break;
+            if (t < 0.0) continue;
+            const float3 p = oa + da * t;
+            const float bay = TileHash(float2(plane * 1.7 + style, 4.1));
+            if ((style == 0 || style == 3) && bay < 0.18) continue; // standing / wheelchair bays
+            const bool inSeat = (p.z > 0.06 && p.z < aisle0) || (p.z > aisle1 && p.z < span - 0.06);
+            const float zEdge = min(abs(p.z - (p.z < span * 0.5 ? 0.06 : aisle1)), abs(p.z - (p.z < span * 0.5 ? aisle0 : span - 0.06)));
+            const float topY = yFloor + st.back - 0.10 * (1.0 - saturate(zEdge / 0.10)); // rounded shoulders
+            if (inSeat && p.y > yFloor + 0.05 && p.y < topY && !(endView && oa.x + da.x * t < 2.2)) { tBest = t; hit = 3; seatFace = da.x > 0.0 ? -1.0 : 1.0; break; }
+        }
+    }
+    if (abs(da.y) > 1e-4) { // cushions, 0.45 m up, in front of each back
+        const float t = (yFloor + 0.45 - oa.y) / da.y;
+        if (t > 0.0 && t < tBest) {
+            const float3 p = oa + da * t;
+            const float f = frac(p.x / st.pitch);
+            if (((p.z > 0.06 && p.z < aisle0) || (p.z > aisle1 && p.z < span - 0.06)) && f > 0.04 && f < 0.52 && TileHash(float2(floor(p.x / st.pitch) * st.pitch * 1.7 + style, 4.1)) >= ((style == 0 || style == 3) ? 0.18 : 0.0)) { tBest = t; hit = 4; }
+        }
+    }
+    if (endView) { // driver's cab: dashboard just behind the glass, driver's seat on the left
+        if (d.y < 0.0) {
+            const float t = (0.06 - o.y) / d.y; const float3 p = o + d * t;
+            if (t > 0.0 && t < tBest && p.z < 0.75) { tBest = t; hit = 8; }
+        }
+        const float t = (1.20 - o.z) / d.z; const float3 p = o + d * t;
+        if (t > 0.0 && t < tBest && p.x > W * 0.10 && p.x < W * 0.40 && p.y > yFloor + 0.45 && p.y < yFloor + 1.30) { tBest = t; hit = 3; seatFace = 1.0; }
+    }
+    float3 poleN = 0;
+    if (st.poles > 0.5) {
+        // vertical poles in the aisle every 2.4 m (2D circle test in the x/z plane), and one ceiling rail over each seat row
+        const float2 o2 = float2(oa.x, oa.z), d2r = float2(da.x, da.z);
+        const float xa = oa.x, xb = oa.x + da.x * min(tBest, 20.0);
+        const float kLo = floor(min(xa, xb) / 2.4) - 1.0;
+        [loop] for (int k = 0; k < 6; ++k) {
+            const float2 c = float2((kLo + k) * 2.4 + 0.3, aisle0 + 0.02);
+            const float t = RayCircle(o2, d2r, c, 0.022);
+            if (t < tBest) { const float3 p = oa + da * t; if (p.y > yFloor && p.y < yCeil) { tBest = t; hit = 5; poleN = float3(normalize(float2(p.x, p.z) - c), 0); } }
+        }
+        const float2 oy = float2(oa.y, oa.z), dy2 = float2(da.y, da.z);
+        [unroll] for (int r = 0; r < 2; ++r) {
+            const float2 c = float2(yCeil - 0.18, r == 0 ? aisle0 - 0.10 : aisle1 + 0.10);
+            const float t = RayCircle(oy, dy2, c, 0.018);
+            if (t < tBest) { tBest = t; hit = 5; }
+        }
+    }
+    if (style == 1 && !endView && d.y > 0.0) { // coach parcel racks over both seat rows
+        const float t = (H + 0.08 - o.y) / d.y;
+        const float3 p = o + d * t;
+        if (t > 0.0 && t < tBest && (p.z < 0.48 || p.z > st.depth - 0.48)) { tBest = t; hit = 6; }
+    }
+    // shade the hit
+    const float3 q = endView ? float3(oa.z, oa.y, oa.x) + d * tBest : o + d * tBest; // back to x-along / z-in for patterns
+    const float3 qa = oa + da * tBest;
+    const float3 fabric = saturate(i.color.rgb);
+    float3 alb = float3(0.55, 0.55, 0.56); float glow = 0.0; float ao = 1.0;
+    if (hit == 0 || hit == 7) { // far wall / side wall: windows with pillars, ad cards above, panelling below
+        const float along = hit == 7 ? qa.x : q.x;
+        const float pil = endView ? 0.5 : frac(along / max(W, 0.8) + 0.37); // end view: plain walls, one rear window
+        if (q.y > 0.05 && q.y < H - 0.05 && pil > 0.06) { alb = lerp(float3(0.55, 0.62, 0.70), float3(0.80, 0.85, 0.90), saturate(q.y / H)); glow = 0.9; }
+        else if (q.y > H + 0.06 && q.y < yCeil - 0.08) { alb = lerp(float3(0.85, 0.3, 0.2), float3(0.2, 0.45, 0.8), TileHash(float2(floor(along / 1.2), 9.0))) * (frac(along / 1.2) > 0.08 ? 1.0 : 0.3); }
+        else alb = float3(0.52, 0.53, 0.55) * (0.9 + 0.1 * TileNoise(float2(along * 2.0, q.y * 2.0)));
+    } else if (hit == 1) { alb = float3(0.30, 0.31, 0.34) * (0.85 + 0.3 * TileNoise(q.xz * 4.0)); ao = lerp(0.55, 1.0, saturate(q.z / 0.6)); }
+    else if (hit == 2) {
+        alb = float3(0.78, 0.78, 0.76);
+        const float zz = endView ? qa.z : q.z;
+        if (abs(zz - span * 0.22) < 0.09 || abs(zz - span * 0.78) < 0.09) { alb = float3(1.0, 0.97, 0.9); glow = 2.2; }
+    }
+    else if (hit == 3) {
+        const float top = smoothstep(st.back - 0.16, st.back - 0.10, qa.y - yFloor);
+        alb = seatFace < 0.0 ? lerp(fabric, float3(0.75, 0.75, 0.75), top) : float3(0.28, 0.29, 0.31); // fabric front, plastic shell behind; grab top
+        alb *= 0.85 + 0.3 * TileNoise(float2(qa.z * 9.0, qa.y * 9.0)); // moquette
+    }
+    else if (hit == 4) alb = fabric * (0.9 + 0.2 * TileNoise(float2(qa.x * 8.0, qa.z * 8.0)));
+    else if (hit == 5) { alb = float3(0.85, 0.65, 0.08); glow = 0.15; }
+    else if (hit == 6) alb = float3(0.35, 0.36, 0.38);
+    else if (hit == 8) { // dashboard: dark moulding with lit instrument screens
+        const float3 p = o + d * tBest;
+        alb = float3(0.10, 0.10, 0.11);
+        if (p.z > 0.25 && p.z < 0.55 && abs(frac(p.x / max(W, 0.8) * 3.0) - 0.5) < 0.30) { alb = float3(0.20, 0.45, 0.65); glow = 1.2; }
+    }
+    const float cloud = CloudSun(i.worldPos);
+    float skyVis;
+    const float3 ambientIn = IndirectDiffuse(i.worldPos, N, skyVis);
+    const float depthFade = saturate(1.0 - tBest * 0.08);
+    const float3 lamps = float3(1.0, 0.96, 0.88) * 0.55;
+    float3 room = pow(alb, 2.2) * (ambientIn * 0.55 + lamps) * ao * (0.55 + 0.45 * depthFade) + pow(alb, 2.2) * glow * (ambientIn * 0.5 + 0.25);
+    // glass overlay atlas: tint, frit, blinds, curtains, vents, ad wrap, sash bars and the black border all live here
+    const float2 auv = (float2(variant % 4, variant / 4) + float2(lu, lv)) / 4.0;
+    const float4 ov = gAlbedo.Sample(gTexSampler, auv);
+    float share;
+    const float3 ovLit = LitPbr(pow(saturate(ov.rgb), 2.2), N, i.worldPos, gPixelShadow * cloud, 0.45, 0.0, cloud, share);
+    const float3 v = -eyeToP;
+    const float nv = saturate(dot(N, v));
+    const float F = 0.04 + 0.96 * pow(1.0 - nv, 5.0);
+    const float3 refl = SkyReflection(reflect(eyeToP, N), 0.05);
+    const float3 glass = room * 0.80 * (1.0 - F) + refl * F;
+    return float4(lerp(glass, ovLit, ov.a), 0.76 + 0.23 * share);
+}
+
+// Track R's dithered LOD transitions (Renderer::SetDrawFade): an old and a new representation of the same buildings, each showing the
+// pixels the other hides, by a per-pixel value that moves every frame so TAA blends the two.
+float FadeNoise(float2 p) {
+    p += fmod(gLight.eye.w, 64.0) * 5.588238;
+    return frac(52.9829189 * frac(dot(p, float2(0.06711056, 0.00583715))));
+}
+bool FadeHides(float2 pixel, float keep) {
+    if (keep == 0.0 || abs(keep) >= 0.999) return false;
+    const float n = FadeNoise(pixel);
+    return keep > 0.0 ? n >= keep : n < -keep;
+}
+
+// The HDR scene: linear color, physically based sun. Vertex alpha below 0.25 marks terrain.
+// The building atlas branch of PSMain (helpers and layout above, by Material()).
+// The world atlas's face projection (fly/world_tex.h tags the faces; uv is not used): T along the face's horizontal, B up the face
+// (up the slope on a roof, north on a flat one). The photograph's up is B.
+void WorldFaceFrame(float3 ng, out float3 T, out float3 B) {
+    T = abs(ng.y) < 0.999 ? normalize(cross(float3(0, 1, 0), ng)) : float3(1, 0, 0);
+    B = cross(ng, T);
+}
+float2 WorldFaceUv(VSOut i, float3 T, float3 B, float m) {
+    const float3 P = WorldTexPos(i.worldPos);
+    return float2(dot(P, T), -dot(P, B)) / m;
+}
+// ---- flat roofs: what a real one has from the air. city.h tags each flat roof with its building's long axis (uv.x = 10 + angle)
+// and size (uv.y = 7 + 0.9 x area / 40000 m^2). Laid out along that axis: weathering blotches and ponding stains, membrane seams,
+// rows of skylights on the big sheds and stations, and plant (AC units, hatches, lift rooms) with the dark ring of their shadow.
+// Every feature is box-filtered against the pixel's footprint and falls back to its average coverage when too small to resolve,
+// so a 400 m roof is never one blank sheet and never shimmers. (Before: the one photograph tiled flat over the whole roof.)
+float RoofHash(float2 p) { return frac(sin(dot(p, float2(127.1, 311.7))) * 43758.5453); }
+float RoofBox(float x, float halfW, float fp) { return saturate((halfW - abs(x)) / max(fp, 1e-3) + 0.5); } // 1 inside, edges a pixel wide
+void RoofDetail(VSOut i, inout float3 albedo, inout float roughness) {
+    const float ang = i.uv.x - 10.0, big = saturate((i.uv.y - 7.0) / 0.9);
+    const float2 A = float2(cos(ang), sin(ang)), Bn = float2(-A.y, A.x);
+    const float3 P = WorldTexPos(i.worldPos);
+    const float2 st = float2(dot(P.xz, A), dot(P.xz, Bn)); // along, across the building
+    const float fp = max(max(length(ddx(P.xz)), length(ddy(P.xz))), 0.02); // metres per pixel
+    const float seed = RoofHash(float2(ang * 97.0 + floor(P.y * 2.0) * 0.37, floor(P.y * 2.0)));
+    const float lum = dot(albedo, float3(0.2126, 0.7152, 0.0722));
+    // weathering: soft blotches (dirt, patched membrane, ponding) at two scales
+    const float blot = TerrainNoise(P.xz / 19.0 + seed * 13.0) * 0.6 + TerrainNoise(P.xz / 6.1 + seed * 7.0) * 0.4;
+    albedo *= lerp(0.78, 1.06, blot);
+    // membrane / panel seams across the long axis, only where a pixel can show them
+    const float seamP = 1.6 + seed * 0.9;
+    const float seam = RoofBox((frac(st.x / seamP) - 0.5) * seamP, 0.05, fp) * (1.0 - smoothstep(0.08, 0.25, fp));
+    albedo *= 1.0 - 0.12 * seam;
+    // skylight rows / glazed ribs along the long axis: most big sheds and stations, a few mid-size roofs
+    if (RoofHash(float2(seed, 3.1)) < big * 1.2 - 0.15) {
+        const float per = lerp(6.0, 11.0, RoofHash(float2(seed, 5.7))), hw = per * lerp(0.12, 0.22, RoofHash(float2(seed, 8.3)));
+        const float m = lerp(RoofBox((frac(st.y / per) - 0.5) * per, hw, fp), 2.0 * hw / per, smoothstep(per * 0.2, per * 0.6, fp));
+        const bool clear = RoofHash(float2(seed, 9.9)) < 0.55; // dark glazing (the sky in it) or milky polycarbonate
+        const float3 sky = clear ? float3(0.10, 0.12, 0.14) : float3(0.62, 0.64, 0.63);
+        albedo = lerp(albedo, sky, m * 0.85);
+        roughness = lerp(roughness, clear ? 0.15 : 0.45, m);
+        // the rib frames between the panes
+        const float ribP = 2.4;
+        albedo *= 1.0 - 0.25 * m * RoofBox((frac(st.x / ribP) - 0.5) * ribP, 0.08, fp) * (1.0 - smoothstep(0.1, 0.3, fp));
+    }
+    // plant: a jittered grid of cells, some holding a unit; size and spacing shrink a little on small roofs
+    const float cellW = lerp(7.0, 11.0, seed);
+    const float2 c = floor(st / cellW), f = st - (c + 0.5) * cellW;
+    const float h0 = RoofHash(c + seed * 31.0), h1 = RoofHash(c * 1.7 + 11.0 + seed), h2 = RoofHash(c * 2.3 + 23.0 - seed);
+    const float present = step(h0, lerp(0.25, 0.5, seed));
+    const float2 hs = float2(lerp(0.8, 2.2, h1), lerp(0.6, 1.4, h2)), off = (float2(h1, h2) - 0.5) * (cellW * 0.5 - hs);
+    const float2 g = f - off;
+    const float unit = RoofBox(g.x, hs.x, fp) * RoofBox(g.y, hs.y, fp);
+    const float ring = saturate(RoofBox(g.x, hs.x + 0.7, fp) * RoofBox(g.y, hs.y + 0.7, fp) - unit);
+    const float far = smoothstep(cellW * 0.15, cellW * 0.5, fp); // past resolving: their average share of the roof
+    const float cover = lerp(0.25, 0.5, seed) * 4.0 * hs.x * hs.y / (cellW * cellW);
+    const float3 unitCol = h2 < 0.6 ? float3(0.52, 0.53, 0.52) : float3(0.22, 0.23, 0.24);
+    const float mUnit = lerp(unit * present, cover, far), mRing = lerp(ring * present, cover * 0.8, far);
+    albedo = lerp(albedo, unitCol, mUnit * 0.9);
+    albedo *= 1.0 - 0.35 * mRing;
+    // a light membrane reads warm grey from the air, not paper white: its dirt and the gravel ballast pull it down
+    albedo *= lum > 0.40 ? lerp(1.0, 0.72, saturate((lum - 0.40) * 2.5)) : 1.0;
+}
+
+float4 AtlasBuildingPS(VSOut i) {
+    const float cell = clamp(floor((i.color.a - 3.0) * 64.0), 0.0, 63.0);
+    const float m = kWorldTexMetres[(int)cell];
+    const float3 ng = normalize(i.normal);
+    float3 T, B;
+    WorldFaceFrame(ng, T, B);
+    const float2 uvT = WorldFaceUv(i, T, B, m);
+    const float3 dpx = ddx(i.worldPos), dpy = ddy(i.worldPos);
+    const float2 dux = float2(dot(dpx, T), -dot(dpx, B)) / m, duy = float2(dot(dpy, T), -dot(dpy, B)) / m;
+    float4 alb, nt;
+    float fade;
+    WorldCellTap(cell, uvT, dux, duy, alb, nt, fade);
+    alb = lerp(alb, float4(kWorldTexMean[(int)cell], alb.a), fade); // past the photograph's last safe mip: its average, no shimmer
+    nt.xyz = lerp(nt.xyz, float3(0.5, 0.5, 1.0), fade);
+    const float3 tn = nt.xyz * 2.0 - 1.0;
+    const float3 n = normalize(tn.x * T + tn.y * B + tn.z * ng);
+    float3 albedo = pow(saturate(alb.rgb * min(i.color.rgb, 3.0)), 2.2);
+    // building to building and storey to storey the same photograph is never quite the same: slow, faint variation
+    const float3 Pw = WorldTexPos(i.worldPos);
+    albedo *= lerp(0.90, 1.08, TerrainNoise(Pw.xz / 23.0 + Pw.y / 31.0 + cell));
+    float roughness = alb.a, metal = cell == kWT_metal_corrugated || cell == kWT_roof_metal_seam || cell == kWT_steel_painted ? 0.6 : 0.0;
+    if (ng.y > 0.97 && i.uv.y >= 7.0 && i.uv.y < 8.0) RoofDetail(i, albedo, roughness);
+    // walls past resolving their floors: the window bands are separate strips of geometry (city.h Block), dark glass on light wall,
+    // that alias into barcode stripes and chevrons once a storey is a pixel or two. Pull both toward a shared facade brightness
+    // there, as distant glass does in photographs (it shows the sky and the rooms, not black).
+    if (abs(ng.y) < 0.4) {
+        const float fpw = max(length(dpx), length(dpy));
+        const float k = smoothstep(0.35, 1.4, fpw) * 0.5;
+        const float L = max(dot(albedo, float3(0.2126, 0.7152, 0.0722)), 1e-3);
+        albedo *= exp(log(0.16 / L) * k);
+        albedo = lerp(albedo, dot(albedo, float3(0.2126, 0.7152, 0.0722)), k * 0.6); // brightened brick must not turn salmon
+    }
+    if (ng.y > 0.5) { // roofs: where there are aerial photographs, the real roof's colour from afar (as RoofPS)
+        const float eyeDist = length(gLight.eye.xyz - i.worldPos);
+        float w;
+        const float3 img = GroundImagery(i.worldPos, eyeDist, w);
+        w *= smoothstep(60.0, 250.0, eyeDist);
+        if (w > 0.0) {
+            const float la = max(dot(albedo, float3(0.2126, 0.7152, 0.0722)), 1e-4), li = dot(img, float3(0.2126, 0.7152, 0.0722));
+            albedo = lerp(albedo, lerp(albedo * (li / la), img, saturate(gLight.portals[69].x + 0.2)), w);
+        }
+    }
+    // As the world-surface path does it (IsWorldSurface in PSMain): crevices hold less light close up, faces tilted up by the
+    // normal map see more sky, and the weathering rules dirty the foot and streak the walls.
+    const float near = 1.0 - smoothstep(kPomNear, kPomFar * 2.0, length(i.worldPos - gLight.eye.xyz));
+    albedo *= lerp(1.0, lerp(0.75, 1.0, nt.a), near) * clamp(1.0 + 1.1 * (n.y - ng.y), 0.55, 1.4);
+    // walls only: the photographs already carry their roofs' wear, and Weather's rust and dust (fixed colours) blotched dark roofs
+    if (abs(ng.y) < 0.4) Weather(i, ng, albedo, roughness, metal);
+    gMatAO = 1.0;
+    float share;
+    const float cloudSun = CloudSun(i.worldPos);
+    const float3 lit = LitPbr(albedo, n, i.worldPos, gPixelShadow * cloudSun, roughness, metal, cloudSun, share);
+    const float shareAlpha = 0.76 + 0.23 * share;
+    return float4(lit, roughness < 0.35 ? -shareAlpha : shareAlpha);
+}
+
+float4 PSMain(VSOut i) : SV_Target {
+    if (FadeHides(i.pos.xy, MATERIAL_CONSTANTS.w)) discard;
+    gShadowPixel = i.pos.xy;
+    if (FEATURE_OFF(256)) { // Graphics > Quality: Unlit (and TBD_FEATURECOST): the texture under a fixed half-Lambert key, no shadows or probes
+        const bool atlasUnlit = IsAtlasBuilding(i.color.a);
+        float4 tex = atlasUnlit ? float4(kWorldTexMean[(int)clamp(floor((i.color.a - 3.0) * 64.0), 0.0, 63.0)], 1.0) : gAlbedo.Sample(gTexSampler, i.uv);
+        clip(tex.a - 0.4);
+        if (abs(i.color.a - 0.68) < 0.003) { // hair: its colour channels carry data (hair_vertex.h), and its texture may be a data atlas
+            const HairData h = HairDecode(i.color);
+            tex.rgb = h.melaninMode ? sqrt(HairBaseColor(h, tex.b, tex.r)) * 0.5 : tex.rgb;
+            i.color.rgb = 1.0;
+        }
+        float3 n = dot(i.normal, i.normal) > 1e-6 ? normalize(i.normal) : float3(0, 1, 0);
+        float3 base = (i.color.a < 0.15 || IsReliefGround(i.color.a)) ? float3(0.40, 0.30, 0.21) : pow(saturate(tex.rgb), 2.2) * (abs(i.color.a - 0.645) < 0.003 ? 1.0 : saturate(i.color.rgb));
+        float key = 0.35 + 0.65 * saturate(dot(n, normalize(float3(0.4, 0.8, 0.3))) * 0.5 + 0.5);
+        return float4(base * key * 6.0, 0.9);
+    }
+    const bool atlas = IsAtlasBuilding(i.color.a); // before the foliage mark: its band [3, 4) is above foliage's 1.5
+    if (!atlas && i.color.a >= 6.0 && i.color.a < 9.0) return GseHullPS(i); // SPOM hull: a whole ground vehicle in one box or card (gse.h)
+    if (!atlas && i.color.a > 1.5) { gFoliage = true; i.color.a -= 2.0; } // VSVegetation's mark
+    if (dot(i.normal, i.normal) < 1e-6) return float4(pow(saturate(i.color.rgb), 2.2), i.color.a);
+    // The sun's shadow, once per pixel, for whichever material below lights it: each one used to call ShadowFactor itself, and
+    // fxc inlined a copy of the whole PCSS filter into every material path (most of a 4 minute D3D12 compile). The tight map's
+    // spread is the material's: hair 2x (many see-through strands), skin 3x (light travelling under it), else 1x.
+    gTightSoft = abs(i.color.a - 0.68) < 0.003 ? 2.0 : (abs(i.color.a - 0.5) < 0.1 ? 3.0 : 1.0);
+    gPixelShadow = ShadowFactor(i.shadowPos, i.tightPos);
+    gPixelShadow = min(gPixelShadow, CityShadow(i.worldPos, normalize(i.normal), ShadowNoise(), i.shadowPos)); // the baked city shadows (city_shadow.hlsli)
+    if (atlas) return AtlasBuildingPS(i);
+    if (i.color.a < 0.15) return TerrainPS(i);
+    if (abs(i.color.a - 0.8) < 0.004) return SpomPS(i); // silhouette POM volume (balcony, canopy)
+    if (abs(i.color.a - 0.83) < 0.004) return TrackPS(i); // SPOM railway track
+    if (abs(i.color.a - 0.84) < 0.004) return JunctionPS(i); // SPOM rail junction / level crossing (one texture over the box)
+    if (i.color.a > 0.806 && i.color.a < 0.824) return SlabPS(i); // SPOM building faces (walls, roofs)
+    if (abs(i.color.a - 0.645) < 0.003) return GlassPS(i);
+    if (abs(i.color.a - 0.70) < 0.003) return InteriorPS(i); // vehicle windows: interior mapping
+    if (abs(i.color.a - 0.665) < 0.003) return RoomGlassPS(i); // building windows: a room behind scratched glass
+    if (abs(i.color.a - 0.68) < 0.003) return HairCardPS(i);
+    if (abs(i.color.a - 0.995) < 0.003) return ToothPS(i);
+    if (abs(i.color.a - 0.985) < 0.003) return MouthWetPS(i);
+    if (abs(i.color.a - 0.975) < 0.003) return EyePS(i);
+    float4 color;
+    float3 n;
+    if (IsReliefGround(i.color.a) && GroundAtlasBound()) {
+        // Slow patches and the splat's mix tint the layers; the wet rule below does not reach this path.
+        float3 tex, groundN;
+        float occlusion, rough, near;
+        const float3 ng = normalize(i.normal);
+        GroundLayers(i, ng, tex, groundN, occlusion, rough, near);
+        float3 w = max(i.color.rgb, 0.0);
+        const float total = w.r + w.g + w.b;
+        w = lerp(float3(0.7, 0.2, 0.1), w / max(total, 1e-4), saturate(total * 20.0));
+        const float3 tint = float3(1.0, 1.0, 1.0) * w.r + float3(0.84, 0.97, 0.82) * w.g + float3(0.85, 0.94, 1.07) * w.b;
+        const float patchA = TileNoise(i.worldPos.xz * 0.11) * 0.6 + TileNoise(i.worldPos.xz * 0.47) * 0.4;
+        float3 a = pow(saturate(tex * tint), 2.2) * lerp(0.82, 1.06, smoothstep(0.2, 0.8, patchA)) * lerp(0.85, 1.0, occlusion);
+        a *= lerp(1.0, 0.42, near * near); // dirt held in the shade of walls: contact darkening beside buildings
+        const float groundWet = saturate(gLight.probePrev.w * 1.6 - TileNoise(i.worldPos.xz * 0.15) * 0.6) * saturate(ng.y * 2.0 - 1.0); // as in PSMain (Lagarde 2013)
+        a = pow(a, lerp(1.0, 1.35, groundWet));
+        rough = lerp(rough, 0.14, groundWet);
+        float groundShare;
+        const float groundCloud = CloudSun(i.worldPos);
+        const float3 lit = LitPbr(a, groundN, i.worldPos, gPixelShadow * groundCloud, lerp(max(rough, 0.6), rough, saturate(gLight.probePrev.w * 2.0)), 0.0, groundCloud, groundShare);
+        return float4(lit, 0.76 + 0.23 * groundShare);
+    }
+    const bool world = IsWorldSurface(i.color.a);
+    if (world) SurfaceRelief(i, kPomDepth);
+    else if (IsReliefGround(i.color.a)) SurfaceRelief(i, 0.035);
+    Material(i, color, n);
+    if (abs(i.color.a - 0.5) < 0.1) { // scene alpha below 0.75 tells the composite pass to scatter this pixel
+        float4 surface = gSurface.Sample(gTexSampler, i.uv);
+        surface.g *= 1.0 - SkinWrinkle(i) * saturate((0.5 - surface.a) * 3.0) * 0.6; // an open groove is a cavity too
+        float skinShare;
+        const float3 skin = LitSkin(pow(saturate(color.rgb), 2.2), n, i.worldPos, gPixelShadow, CloudSun(i.worldPos), surface.rgb, skinShare);
+        return float4(skin, 0.25 + 0.45 * skinShare);
+    }
+    if (abs(i.color.a - 0.95) < 0.03)
+        return float4(LitEye(pow(saturate(color.rgb), 2.2), n, i.worldPos, gPixelShadow * CloudSun(i.worldPos)), 1.0);
+    float share;
+    if (abs(i.color.a - 0.61) < 0.005) {
+        float clothShare;
+        const float clothCloud = CloudSun(i.worldPos);
+        float3 cloth = LitCloth(pow(saturate(color.rgb), 2.2), n, i.worldPos, gPixelShadow * clothCloud, 0.75, clothCloud, clothShare);
+        return float4(cloth, 0.76 + 0.23 * clothShare);
+    }
+    float roughness, metal;
+    PbrFromAlpha(i.color.a, roughness, metal);
+    if (abs(i.color.a - 0.63) < 0.005) roughness = 0.5; // leather
+    if (i.color.a < 0.25 || abs(i.color.a - 0.75) < 0.1) { // ground moisture: dark and glossy, gathering in the low-frequency hollows (Lagarde, "Water drop", 2013)
+        const float wet = saturate(gLight.probePrev.w * 1.6 - TileNoise(i.worldPos.xz * 0.15) * 0.6) * saturate(n.y * 2.0 - 1.0);
+        color.rgb = pow(saturate(color.rgb), lerp(1.0, 1.35, wet)); // albedo drops, in display space before the pow below
+        roughness = lerp(roughness, 0.14, wet);
+    }
+    const float cloudSun = CloudSun(i.worldPos);
+    float3 albedoLinear = pow(saturate(color.rgb), 2.2);
+    const float3 emissiveColor = albedoLinear;
+    const float4 extra = gExtra.SampleGrad(gTexSampler, i.uv + sPomOffset, ddx(i.uv), ddy(i.uv));
+    metal = saturate(metal * extra.b); // the default texel is 1: the material's own factor stands
+    gMatAO = extra.r;
+    if (world) {
+        // First-order ambient barely answers a small tilt, so a wall out of the sun lost its relief: boards facing up see more sky, and crevices less of anything.
+        roughness = saturate(roughness * sRoughScale);
+        if (!sArt && !sAuthored) albedoLinear *= lerp(0.45, 1.0, sCavity) * clamp(1.0 + 1.1 * (n.y - normalize(i.normal).y), 0.55, 1.4);
+        if (!sArt && !sAuthored && !gFoliage) { // the extra map's G says how much weathering the material takes (1 = all, 0 = it is authored as it should look)
+            const float3 albedo0 = albedoLinear;
+            const float rough0 = roughness, metal0 = metal;
+            Weather(i, normalize(i.normal), albedoLinear, roughness, metal);
+            albedoLinear = lerp(albedo0, albedoLinear, extra.g);
+            roughness = lerp(rough0, roughness, extra.g);
+            metal = lerp(metal0, metal, extra.g);
+        }
+    } else if (IsReliefGround(i.color.a)) {
+        roughness = saturate(roughness * sRoughScale);
+        albedoLinear *= lerp(0.55, 1.0, sCavity);
+    }
+    if (gLight.lightDebug.x > 15.5 && gLight.lightDebug.x < 16.5) return float4(metal, roughness, extra.b, 1.0); // TBD_LIGHTDEBUG 16: the material as shaded
+    const float airframe = MATERIAL_CONSTANTS.y; // < 0: an aircraft's skin, -(1 + coat) (Renderer::SetAirframe)
+    if (airframe < -0.5) gAirframe = 1.0;
+    if (airframe < -1.001 && metal < 0.5) gSpecular *= 1.0 + 0.9 * (airframe + 1.0); // under lacquer the paint itself barely reflects
+    float3 lit = LitPbr(albedoLinear, n, i.worldPos, gPixelShadow * cloudSun * sPomShadow, roughness, metal, cloudSun, share);
+    if (airframe < -1.001 && metal < 0.5) lit = Clearcoat(lit, n, normalize(i.normal), i.worldPos, gPixelShadow * cloudSun, saturate(-airframe - 1.0));
+    lit += CockpitLights(albedoLinear, n, i.worldPos, roughness, metal);
+    lit += emissiveColor * (extra.a * extra.a * kEmissiveScale); // glass of a lantern, embers, a lit window: light the surface gives off
+    if (gFoliage) share *= 0.5; // screen-space occlusion overdoes a tuft of thin blades
+    const float shareAlpha = 0.76 + 0.23 * share; // above 0.75: not skin; 1.0 (eyes, clear) keeps the older occlusion
+    // Negative: smooth enough for the composite's screen-space reflection. Not an aircraft's skin: Clearcoat already gave it the sky and
+    // the ground, and the composite's march, on a normal rebuilt from depth per 2x2 quad, tears a convex hull into a blocky mosaic of
+    // itself and the runway (the tail cone seen from behind).
+    return float4(lit, roughness < 0.35 && gAirframe < 0.5 ? -shareAlpha : shareAlpha);
+}
+
+// The scene, for things that say how they moved: uv this frame minus uv last frame. Zero means "ask the depth buffer" (see TaaPS).
+// The motion target's z is skin's surface reflection (luminance, see LitSkin): the scatter pass keeps it out of the blur. 0 elsewhere.
+struct PSOutMotion {
+    float4 color : SV_Target0;
+    float4 velocity : SV_Target1;
+};
+PSOutMotion PSMainMotion(VSOutMotion i) {
+    PSOutMotion o;
+    o.color = PSMain(i.base);
+    const float2 cur = i.curClip.xy / i.curClip.w, prev = i.prevClip.xy / i.prevClip.w;
+    o.velocity = float4(float2(cur.x - prev.x, prev.y - cur.y) * 0.5, dot(gSkinSpecular, float3(0.2126, 0.7152, 0.0722)), 0.0);
+    return o;
+}
+
+void PSVegetationDepth(VSOutDepth i) {
+    clip(gAlbedo.Sample(gTexSampler, i.uv).a - 0.4);
+}
+// Every pixel that reaches this already passed the alpha test, so the depth test may run first even though Material can clip.
+[earlydepthstencil]
+PSOutMotion PSVegetationShade(VSOutMotion i) { return PSMainMotion(i); }
+
+// Editor overlays, drawn after tone mapping: display-space colors go straight through.
+float4 PSOverlay(VSOut i) : SV_Target {
+    if (dot(i.normal, i.normal) < 1e-6) return i.color;
+    float4 color;
+    float3 n;
+    Material(i, color, n);
+    return float4(Lit(color.rgb, n, ShadowFactor(i.shadowPos, i.tightPos)), color.a);
+}
+
+// The shadow passes (the sun's map and the tight character map): depth only, from the sun.
+float4 ShadowVS(VSIn v) : SV_Position {
+    return mul(pc.mvp, float4(v.pos, 1.0));
+}
+
+float4 ShadowInstancedVS(VSIn v, InstanceIn inst) : SV_Position {
+    float3 world = InstanceWorld(v, inst);
+    if (v.color.a > 0.29 && v.color.a < 0.39) { // short-range grass: as in ShadowVegetationVS, gone by 20 m
+        const float3 root = float3(inst.row0.w, inst.row1.w, inst.row2.w);
+        const float t = saturate((20.0 - length(root - gLight.eye.xyz)) / 7.0);
+        world = root + (world - root) * (t * t * (3.0 - 2.0 * t));
+    }
+    return mul(pc.mvp, float4(world, 1.0));
+}
+
+// ------------------------------------------------------------------ city chunk bakes and volumes (Track R, src/city_buildings.inl)
+// The bake: a cell's buildings drawn through one face's orthographic matrix (ChunkFaceMatrix, chunk_faces.hlsli) into the impostor
+// store's three targets. Two pipelines share this shader: the surface pass (depth LESS; targets 0 and 1) and the relief pass (no
+// depth test, MIN blend into target 2 only), so target 2 ends up with the first and the last surface along the face's view.
+#include "chunk_faces.hlsli"
+struct ChunkBakeVSOut {
+    float4 pos : SV_Position;
+    float4 color : COLOR;
+    float3 normal : NORMAL;
+    float2 uv : TEXCOORD0;
+};
+ChunkBakeVSOut ChunkBakeVS(VSIn v, InstanceIn inst) {
+    ChunkBakeVSOut o;
+    const float3 world = InstanceWorld(v, inst);
+    o.pos = mul(pc.mvp, float4(world, 1.0));
+    const float3 c0 = float3(inst.row0.x, inst.row1.x, inst.row2.x), c1 = float3(inst.row0.y, inst.row1.y, inst.row2.y), c2 = float3(inst.row0.z, inst.row1.z, inst.row2.z);
+    o.normal = cross(c1, c2) * v.normal.x + cross(c2, c0) * v.normal.y + cross(c0, c1) * v.normal.z;
+    o.color = v.color;
+    o.uv = v.uv;
+    return o;
+}
+struct ChunkBakeOut {
+    float4 albedo : SV_Target0;
+    float4 normal : SV_Target1;
+    float2 relief : SV_Target2;
+};
+ChunkBakeOut ChunkBakePS(ChunkBakeVSOut i) {
+    ChunkBakeOut o;
+    const float a = i.color.a;
+    float3 albedo;
+    if (a > 0.806 && a < 0.824) { // SPOM slab: rgb is the slab's frame, the texture spans the face (SlabPS)
+        const bool roof = a > 0.815;
+        const float2 size = max(i.color.gb, 0.1);
+        albedo = gAlbedo.SampleLevel(gTexSampler, float2(i.uv.x / size.x, roof ? i.uv.y / size.y : 1.0 - i.uv.y / size.y), 2.0).rgb;
+    } else if (abs(a - 0.83) < 0.004) { // SPOM railway track (TrackPS): uv metres across and along, g the box width
+        const float W = max(i.color.g, 0.1);
+        albedo = gAlbedo.SampleLevel(gTexSampler, float2((i.uv.x + 0.5 * W) / W, i.uv.y / 0.6), 1.0).rgb;
+    } else if (abs(a - 0.84) < 0.004) { // SPOM rail junction (JunctionPS): the texture once over the box, holes cut
+        const float4 tex = gAlbedo.SampleLevel(gTexSampler, i.uv / max(float2(abs(i.color.g), i.color.b), 0.5), 1.0);
+        clip(tex.a - 0.1);
+        albedo = tex.rgb;
+    } else if (abs(a - 0.8) < 0.004) { // silhouette POM volume (SpomPS): rg the volume's size
+        const float2 size = max(i.color.rg, 0.05);
+        albedo = gAlbedo.SampleLevel(gTexSampler, float2(i.uv.x / size.x, 1.0 - i.uv.y / size.y), 2.0).rgb;
+    } else if (abs(a - 0.665) < 0.003) { // building windows (RoomGlassPS): its rooms' average under the sky's sheen, as they read from afar
+        albedo = lerp(gAlbedo.SampleLevel(gTexSampler, float2(0.5, 0.5), 12.0).rgb, float3(0.62, 0.68, 0.74), 0.45);
+    } else if (abs(a - 0.70) < 0.003 || abs(a - 0.645) < 0.003) { // other glass: the sky it reflects
+        albedo = float3(0.5, 0.56, 0.62);
+    } else if (IsAtlasBuilding(a)) { // the shared building atlas (AtlasBuildingPS): the cell's tile at the far mip the others use
+        albedo = gAlbedo.SampleLevel(gTexSampler, AtlasUv(i.uv, a), 2.0).rgb * saturate(i.color.rgb);
+    } else {
+        const float4 tex = gAlbedo.SampleLevel(gTexSampler, i.uv, 2.0);
+        clip(tex.a - 0.4);
+        albedo = tex.rgb * saturate(i.color.rgb);
+    }
+    float3 n = dot(i.normal, i.normal) > 1e-8 ? normalize(i.normal) : float3(0, 1, 0);
+    if (abs(a - 0.83) < 0.004 || abs(a - 0.84) < 0.004) n = float3(0, 1, 0); // a track's vertex normal is its forward direction (TrackPS)
+    if (a > 0.806 && a < 0.824) { // a slab's vertex normal is its T, along the face (SlabPS): the face's own normal from it
+        const float3 T = normalize(float3(n.x, 0.0, n.z) + float3(1e-6, 0.0, 0.0));
+        n = a > 0.815 ? float3(0, 1, 0) : float3(-T.z, 0.0, T.x);
+    }
+    o.albedo = float4(albedo, 1.0);
+    o.normal = float4(n * 0.5 + 0.5, 1.0);
+    o.relief = float2(i.pos.z, 1.0 - i.pos.z);
+    return o;
+}
+
+// The chunk volume: one box per far cell, its vertices carrying the box (ChunkVolVS). Each pixel marches the eye ray through the box
+// against the top face's relief (at most 24 steps, then 4 bisections), colours the hit from the face that sees it (the top for a
+// roof, the side facing the ray for a wall, checked against that side's own first surface), lights it like any surface and writes
+// its depth (only ever farther than the box: SV_DepthLessEqual under reversed z keeps early rejection).
+// Vertex alpha 0.852 marks these vertices (free in PSMain's codes), should one ever reach the ordinary pipeline.
+struct ChunkVSOut {
+    noperspective centroid float4 pos : SV_Position; // fxc: a conservative depth output wants this on the position
+    float3 worldPos : TEXCOORD0;
+    nointerpolation float3 boxLo : TEXCOORD1;
+    nointerpolation float3 boxSize : TEXCOORD2;
+    nointerpolation float2 slot : TEXCOORD3; // the cell's strip: its first texel in the atlas
+    float4 clip : TEXCOORD4;
+    nointerpolation float4 eyeClip : TEXCOORD5; // the eye through the same matrix: clip space is linear along the ray
+    nointerpolation float2 qf : TEXCOORD6;      // x the quality (0 low, 1 medium, 2 high), y the fade (SetDrawFade's meaning)
+};
+ChunkVSOut ChunkVolVS(VSIn v) {
+    ChunkVSOut o;
+    o.pos = mul(pc.mvp, float4(v.pos, 1.0));
+    o.worldPos = v.pos;
+    o.boxLo = v.normal;
+    o.boxSize = max(v.color.rgb, 0.01);
+    o.slot = v.uv;
+    o.clip = o.pos;
+    o.eyeClip = mul(pc.mvp, float4(gLight.eye.xyz, 1.0));
+    // alpha = 0.851 + 0.001 * quality + 0.00045 * (fade + 1): the free codes 0.851 .. 0.854 (city_buildings.inl, VolCode)
+    const float x = (v.color.a - 0.851) * 1000.0;
+    const float q = clamp(floor(x + 1e-3), 0.0, 2.0);
+    o.qf = float2(q, clamp((x - q) / 0.45 - 1.0, -1.0, 1.0));
+    return o;
+}
+static float2 sChunkSlot = float2(0, 0);
+static float sChunkTile = 64.0;
+static float2 sChunkAtlas = float2(4096, 4096);
+static float sChunkCarveY = 0.0; // depth under the top's first surface (box units) above which nothing is carved: a road or a roof is
+                                 // edge-on or thin to the side faces; what hangs 2 m and more under an eave or a canopy is carved
+float2 ChunkTexel(int f, float2 uv) { // texel position (not normalized) of face f's (u, v), kept half a texel inside the tile
+    const float2 t = clamp(uv, 0.5 / sChunkTile, 1.0 - 0.5 / sChunkTile) * sChunkTile;
+    return sChunkSlot + float2(f * sChunkTile, 0.0) + t;
+}
+float2 ChunkRelief(int f, float2 uv) { // x: where the solid starts, y: where it ends (0..1 along the face's view); y < x: empty
+    const float2 r = gSurface.SampleLevel(gTexSampler, (floor(ChunkTexel(f, uv)) + 0.5) / sChunkAtlas, 0.0).rg; // the texel's own pair
+    return float2(r.x, 1.0 - r.y);
+}
+// Solid below the top face's first surface, down to the box's floor: a height field. The relief's end is not used from above: walls
+// are edge-on to the top view, so under a tower's roof the deepest surface it sees is often a floor half way down, not the ground.
+// The top surface's start, bilinear between the texels around uv that hold something (one per 2 m texel would put a sloped road a few
+// centimetres under the terrain across half of every texel); the texel's own value where none of them does.
+float ChunkTopStartSmooth(float2 uv, float fallback) {
+    const float2 px = ChunkTexel(0, uv) - 0.5, b = floor(px), f = px - b;
+    const float2 lo = sChunkSlot, hi = sChunkSlot + sChunkTile - 1.0;
+    float sum = 0.0, wsum = 0.0;
+    [unroll] for (int k = 0; k < 4; ++k) {
+        const float2 o = float2(k & 1, k >> 1);
+        const int2 c = int2(clamp(b + o, lo, hi));
+        const float2 r = gSurface.Load(int3(c, 0)).rg;
+        const float w = (o.x > 0.5 ? f.x : 1.0 - f.x) * (o.y > 0.5 ? f.y : 1.0 - f.y);
+        if (1.0 - r.y > r.x) sum += w * r.x, wsum += w;
+    }
+    return wsum > 1e-4 ? sum / wsum : fallback;
+}
+// Then carved by two side faces (one per horizontal axis): a point is solid only where both see something between their first and their
+// last surface there. Without it an eave, a canopy or a podium's edge seen from above fills down to the ground as a block skirt.
+bool ChunkSideSolid(int f, float3 q) {
+    const float3 t = ChunkFaceUVD(f, q);
+    const float2 r = ChunkRelief(f, t.xy);
+    const float e = 1.0 / sChunkTile;
+    return r.y > r.x && t.z >= r.x - e && t.z <= r.y + e;
+}
+bool ChunkSolid(float3 q) {
+    const float3 t = ChunkFaceUVD(0, q);
+    const float2 r = ChunkRelief(0, t.xy);
+    return r.y > r.x && t.z >= r.x - 0.002 && (t.z - r.x < sChunkCarveY || (ChunkSideSolid(1, q) && ChunkSideSolid(3, q)));
+}
+struct ChunkVolOut {
+    float4 color : SV_Target0;
+    float depth : SV_DepthLessEqual;
+};
+float ChunkCheapShadow(float3 sp) { // the low tier: one hardware-filtered tap of the sun's map
+    if (gLight.shadowParams.w < 0.5) return 1.0;
+    const float2 uv = float2(sp.x * 0.5 + 0.5, 0.5 - sp.y * 0.5);
+    if (any(uv < 0.0) || any(uv > 1.0) || sp.z >= 1.0) return 1.0;
+    return gShadowMap.SampleCmpLevelZero(gShadowSampler, uv, sp.z);
+}
+// Tiers (R5), all from the same bake: high 24 march steps and 4 bisections with the full shadow filter; medium 12 and 2; low 6 and 1
+// with one shadow tap. City_buildings.inl picks one per cell from its size on screen, capped by TBD_CHUNK_QUALITY.
+ChunkVolOut ChunkVolPS(ChunkVSOut i, bool front : SV_IsFrontFace) {
+    if (FadeHides(i.pos.xy, i.qf.y)) discard;
+    const int quality = (int)i.qf.x;
+    gShadowPixel = i.pos.xy;
+    sChunkSlot = i.slot;
+    sChunkTile = max(MATERIAL_CONSTANTS.z, 4.0);
+    gSurface.GetDimensions(sChunkAtlas.x, sChunkAtlas.y);
+    const float3 eye = gLight.eye.xyz, lo = i.boxLo, size = i.boxSize;
+    sChunkCarveY = 2.0 / size.y;
+    const float3 toP = i.worldPos - eye;
+    const float lenP = length(toP);
+    const float3 vw = toP / lenP;
+    // The ray against the box, from the eye: [tIn, tOut] metres. A back face only works when the eye is inside (front faces gone).
+    const float3 safe = float3(abs(vw.x) > 1e-6 ? vw.x : 1e-6, abs(vw.y) > 1e-6 ? vw.y : 1e-6, abs(vw.z) > 1e-6 ? vw.z : 1e-6);
+    const float3 inv = 1.0 / safe;
+    const float3 ta = (lo - eye) * inv, tb = (lo + size - eye) * inv;
+    const float3 tmin = min(ta, tb), tmax = max(ta, tb);
+    const float tIn = max(max(max(tmin.x, tmin.y), tmin.z), 0.0), tOut = min(min(tmax.x, tmax.y), tmax.z);
+    const bool inside = all(eye > lo) && all(eye < lo + size);
+    if (!front && !inside) discard;
+    if (tOut <= tIn) discard;
+    const float3 q0 = (eye + vw * tIn - lo) / size, dq = vw / size; // box space: q(t) = q0 + dq * (t - tIn)
+    const int kSteps = quality >= 2 ? 24 : quality == 1 ? 12 : 6;
+    const float dt = (tOut - tIn) / kSteps;
+    float tLo = 0.0, tHi = 0.0;
+    bool hit = false;
+    [loop] for (int k = 0; k <= kSteps; ++k) {
+        tHi = dt * k;
+        if (ChunkSolid(q0 + dq * tHi)) { hit = true; break; }
+        tLo = tHi;
+    }
+    if (!hit) discard;
+    const int kBisect = quality >= 2 ? 4 : quality == 1 ? 2 : 1;
+    [loop] for (int r = 0; r < kBisect; ++r) {
+        const float tm = 0.5 * (tLo + tHi);
+        if (ChunkSolid(q0 + dq * tm)) tHi = tm; else tLo = tm;
+    }
+    float3 q = q0 + dq * tHi;
+    // Which face sees the hit: the top when the hit lies on the top surface of its column (its depth from above matches where the solid
+    // starts, within what the march can resolve). Else a wall: it faces whichever neighbouring top texel toward the eye, along x or
+    // along z, is open at the hit's depth. That side face colours it, unless its first surface there is another building in front
+    // (then the other axis' side, if that one sees it).
+    const float3 tq = ChunkFaceUVD(0, q);
+    const float2 rTop = ChunkRelief(0, tq.xy);
+    const float resolve = 0.012 + abs(dq.y) * dt / (float)(1u << (uint)kBisect) * 1.5; // the hit's height uncertainty, box units
+    int face = 0;
+    if (rTop.y > rTop.x && tq.z - rTop.x < resolve) {
+        // A top surface: the hit snapped onto it exactly (the march stops at the first sample inside, up to a bisection step below).
+        // Roads lie only centimetres over the terrain, which would otherwise win the depth test against them.
+        if (dq.y < -1e-5) {
+            const float start = ChunkTopStartSmooth(tq.xy, rTop.x) - 0.05 / size.y; // and 5 cm up: the bake's roads over the terrain
+            const float tExact = (1.0 - start - q0.y) / dq.y; // where the ray's depth from above (1 - y) reaches the surface's
+            tHi = clamp(tExact, max(tLo - dt, 0.0), tHi);
+            q = q0 + dq * tHi;
+        }
+    } else {
+        const float e = 1.0 / sChunkTile;
+        const float sx = dq.x < 0.0 ? 1.0 : -1.0, sz = dq.z < 0.0 ? 1.0 : -1.0; // toward the eye; the top face's u is x, v is z
+        const float2 rx = ChunkRelief(0, tq.xy + float2(sx * e, 0.0)), rz = ChunkRelief(0, tq.xy + float2(0.0, sz * e));
+        const bool openX = !(rx.y > rx.x) || rx.x > tq.z, openZ = !(rz.y > rz.x) || rz.x > tq.z;
+        const bool alongX = openX == openZ ? abs(vw.x) >= abs(vw.z) : openX;
+        face = ChunkSideFacing(dq, alongX);
+        const float3 ts = ChunkFaceUVD(face, q);
+        const float2 rs = ChunkRelief(face, ts.xy);
+        if (!(rs.y > rs.x) || abs(ts.z - rs.x) > 0.06) {
+            const int other = ChunkSideFacing(dq, !alongX);
+            const float3 to = ChunkFaceUVD(other, q);
+            const float2 ro = ChunkRelief(other, to.xy);
+            if (ro.y > ro.x && abs(to.z - ro.x) <= 0.06) face = other;
+        }
+    }
+    const float2 fuv = ChunkFaceUVD(face, q).xy;
+    const float2 at = ChunkTexel(face, fuv) / sChunkAtlas;
+    const float4 albedo = gAlbedo.SampleLevel(gTexSampler, at, 0.0);
+    const float4 nTex = gNormalMap.SampleLevel(gTexSampler, at, 0.0);
+    if (MATERIAL_CONSTANTS.w > 1.5) { // TBD_CHUNK_DEBUG: the face that coloured the pixel (top grey, east red, west green, south blue, north yellow); dark = nothing baked there
+        const float3 kFace[5] = {float3(0.6, 0.6, 0.6), float3(1, 0, 0), float3(0, 1, 0), float3(0, 0.3, 1), float3(1, 1, 0)};
+        ChunkVolOut d;
+        d.color = float4(MATERIAL_CONSTANTS.w > 2.5 ? pow(saturate(albedo.rgb), 2.2) * 3.0 : kFace[face] * (albedo.a > 0.5 ? 4.0 : 0.3), 0.9); // 3: the albedo, unlit
+        const float4 dc = i.eyeClip + (i.clip - i.eyeClip) * ((tIn + tHi) / lenP);
+        d.depth = saturate(dc.z / dc.w);
+        return d;
+    }
+    const float3 n = normalize(nTex.xyz * 2.0 - 1.0 + float3(0, 1e-4, 0));
+    const float t = tIn + tHi;
+    const float3 wp = eye + vw * t;
+    // Its own light: the sun's shadow at the hit (normal-offset as ShadeVertex does), clouds, sky.
+    const float grazing = 1.0 - saturate(dot(n, gLight.sunDir.xyz));
+    const float3 shadowPos = mul(gLight.shadowVP, float4(wp + n * (gLight.shadowParams.z * (1.0 + 2.0 * grazing)), 1.0)).xyz;
+    const float3 tightPos = mul(gLight.tightVP, float4(wp + n * (gLight.tightParams.z * (1.0 + 2.0 * grazing)), 1.0)).xyz;
+    gTightSoft = 1.0;
+    gPixelShadow = quality >= 1 ? ShadowFactor(shadowPos, tightPos) : ChunkCheapShadow(shadowPos);
+    gPixelShadow = min(gPixelShadow, CityShadow(wp, n, 0.5, shadowPos));
+    gMatAO = nTex.a;
+    const float cloudSun = CloudSun(wp);
+    float share;
+    const float3 lit = LitPbr(pow(saturate(albedo.rgb), 2.2), n, wp, gPixelShadow * cloudSun, 0.8, 0.0, cloudSun, share);
+    ChunkVolOut o;
+    o.color = float4(lit, 0.76 + 0.23 * share);
+    const float4 c = i.eyeClip + (i.clip - i.eyeClip) * (t / lenP);
+    o.depth = saturate(c.z / c.w);
+    return o;
+}
+
+#include "nacho.hlsli"

@@ -1,0 +1,14 @@
+# build outputs
+bin/
+obj/
+build-*/
+build/
+*.pdb
+*.ilk
+*.obj
+engine.log*
+crash_*
+# caches the game writes next to the exe or under the cache root
+shadercache/
+satcache/
+maptiles/
