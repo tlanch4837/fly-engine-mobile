@@ -37,10 +37,10 @@ workflows:
       - name: Package an unsigned .ipa (for sideloading tools that sign it with your Apple ID)
         script: |
           rm -rf Payload && mkdir Payload && cp -R build-ios/Release-iphoneos/fly_engine.app Payload/
-          zip -qry fly_engine_unsigned.ipa Payload
+          zip -qry "fly engine.ipa" Payload
     artifacts:
       - build.log
-      - fly_engine_unsigned.ipa
+      - 'fly engine.ipa'
 
   ios-testflight:
     name: iOS TestFlight
