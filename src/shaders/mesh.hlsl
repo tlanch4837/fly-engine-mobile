@@ -2525,30 +2525,61 @@ float4 AtlasBuildingPS(VSOut i) {
     return float4(lit, roughness < 0.35 ? -shareAlpha : shareAlpha);
 }
 
+// The basic build's ground lighting (FLY_FEATURES bit 131072): LitPbr's diffuse for rough ground (sky ambient, the sun with the
+// Callisto terms at roughness 0.9, the bounce off sunlit ground on slopes), without its GGX highlight and sky reflection, which a
+// rough sward at gSpecular 0.12 barely shows, and without the probe, room and window lookups the basic build never has.
+float3 LeanLight(float3 albedo, float3 n, float3 world, float shadow, float cloudSun, out float ambientShare) {
+    const float kSunScale = 3.2;
+    const float3 v = normalize(gLight.eye.xyz - world), l = gLight.sunDir.xyz, h = normalize(v + l);
+    const float nl = saturate(dot(n, l)), nh = saturate(dot(n, h)), vh = saturate(dot(v, h));
+    const float3 sunC = gLight.sunColor.rgb * kSunScale;
+    float3 irradiance = SkyAmbient(n) * lerp(0.8, 1.0, cloudSun);
+    irradiance += sunC * saturate(l.y) * float3(0.40, 0.29, 0.19) * (0.5 - 0.5 * n.y) * cloudSun * 0.5;
+    irradiance *= (1.0 - 0.6 * gSunCover) * AmbientFill();
+    const float F = 0.04 + 0.96 * pow(1.0 - vh, 5.0);
+    const float c1 = CallistoDiffuse(vh, nh, 1.6, 1.3), c2 = CallistoTerminator(nl, vh, nh, 0.4, 0.5); // roughness 0.9: Callisto at full
+    const float3 ambient = albedo * irradiance, direct = c1 * albedo * sunC * nl * shadow * (1.0 - F) * c2;
+    const float la = dot(ambient, float3(0.2126, 0.7152, 0.0722)), ld = dot(direct, float3(0.2126, 0.7152, 0.0722));
+    ambientShare = la / max(la + ld, 1e-4);
+    return ambient + direct;
+}
+
 // The basic build's ground (FLY_FEATURES bit 65536, set by src/fly/game.cpp): the satellite photograph lit by the sun and the sky,
 // with the aircraft's shadow, the clouds' shadows and the water marks, but none of MappedGroundPS's procedural detail (fields, grass
 // tufts, pavement grain, the world atlas, creeks, seasons, noise bumps), which the photograph covers anyway. It runs ahead of
-// PSMain's PCSS and baked-city shadow and its material switch. On an iPhone 17 Pro that detail was 33 of 55 GPU ms a frame.
+// PSMain's PCSS and baked-city shadow and its material switch; on Metal it is also its own pipeline (PSLeanGround below), clear of
+// PSMain's register load. On an iPhone 17 Pro the procedural detail was 33 of 55 GPU ms a frame.
 float4 LeanGroundPS(VSOut i) {
     float3 a = pow(saturate(i.color.rgb), 2.2);
     float w;
     const float3 img = GroundImagery(i.worldPos, length(gLight.eye.xyz - i.worldPos), w);
     if (w > 0.0) a = lerp(a, img, w);
-    float rough = 0.9;
     gSpecular = 0.12; // grass, soil, fields: matte
     // open water on the terrain (vertex alpha 0.06, blending to the land's 0.08 across a bank): dark, smooth, the sky in it at a slant
     const float water = i.color.a < 0.05 ? 0.0 : saturate((0.08 - i.color.a) / 0.02);
-    if (water > 0.0) {
-        a = lerp(a, float3(0.018, 0.03, 0.032), water);
-        rough = lerp(rough, 0.2, water);
-        gSpecular = lerp(gSpecular, 0.8, water);
-    }
     gTightSoft = 1.0;
     gPixelShadow = ShadowFactor(i.shadowPos, i.tightPos);
     const float cs = CloudSun(i.worldPos);
+    // a sward is thin translucent blades: in a cast shadow sun still gets between them, so shadows on grass read fainter (MappedGroundPS)
+    const float shadow = lerp(lerp(0.45, 1.0, gPixelShadow), gPixelShadow, water) * cs;
+    const float3 n = normalize(i.normal);
     float share;
-    const float3 lit = LitPbr(a, normalize(i.normal), i.worldPos, gPixelShadow * cs, rough, 0.0, cs, share);
+    if (water > 0.0 || !FEATURE_OFF(131072)) { // water keeps the full model: its sky sheen is the point
+        a = lerp(a, float3(0.018, 0.03, 0.032), water);
+        gSpecular = lerp(gSpecular, 0.8, water);
+        const float3 lit = LitPbr(a, n, i.worldPos, shadow, lerp(0.9, 0.2, water), 0.0, cs, share);
+        return float4(lit, 0.76 + 0.23 * share);
+    }
+    const float3 lit = LeanLight(a, n, i.worldPos, shadow, cs, share);
     return float4(lit, 0.76 + 0.23 * share);
+}
+
+// The lean ground as its own pixel shader (Metal's ground pipeline, Renderer::SetLeanGround): only what LeanGroundPS needs is compiled
+// in, so the GPU runs many more pixels at once than through PSMain's whole material switch.
+float4 PSLeanGround(VSOut i) : SV_Target {
+    if (FadeHides(i.pos.xy, MATERIAL_CONSTANTS.w)) discard;
+    gShadowPixel = i.pos.xy;
+    return LeanGroundPS(i); // only the terrain is drawn through this pipeline (vertex alpha 0.06 .. 0.10: fly/world.h)
 }
 
 float4 PSMain(VSOut i) : SV_Target {

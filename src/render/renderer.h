@@ -298,6 +298,9 @@ public:
     // lit draws that follow, until changed. kNoTexture = default. Reset to (none, none) after drawing a textured mesh.
     // `surface` packs per-pixel skin data: R roughness (0.5 = neutral), G cavity (1 = open skin), B scatter amount.
     virtual void SetMaterial(TextureId albedo, TextureId normal, TextureId surface = kNoTexture) = 0;
+    // The basic build's terrain (mesh.hlsl PSLeanGround): lit draws until it is switched off go through the lean ground pipeline,
+    // clear of the full material shader's register load. Metal only; other backends draw PSMain, which branches to the same shading.
+    virtual void SetLeanGround(bool on) { (void)on; }
     // Links a surface texture to its extra material map, bound with it by SetMaterial: R baked occlusion (1 = open), G reserved (1),
     // B metalness scale (1 = the material's own factor), A emissive strength (0 = none). kNoTexture unlinks; the default texel is
     // (255, 255, 255, 0). The link ends when either texture is destroyed. Call outside BeginFrame..EndFrame.

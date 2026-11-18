@@ -81,10 +81,11 @@ struct Game::Impl {
     struct Perf { int64_t last = 0; double cpuMs = 0, gpuMs = 0; } perf;
     // The on-device benchmark (FLY_BENCH=1; on by default on touch devices, FLY_BENCH=0 off): after a warm-up the aircraft is
     // frozen and each setting below runs for a few seconds; the frame interval and the GPU time of each are shown in a table.
-    struct BenchCase { const char* name; float scale; bool sky; int bits; bool shadows; int tier; };
+    struct BenchCase { const char* name; float scale; bool sky; int bits; bool shadows; int tier; bool pipe; };
     // The quality the game runs at (Start): render scale, post tier (0 Low: no AO, no bloom, cheaper clouds), FLY_FEATURES bits
-    // (65536: LeanGroundPS, the satellite photograph without the procedural detail). Phones: 0.75 scale; desktops: full.
-    struct Quality { float scale = 1.0f; int tier = 0; int bits = 65536; } quality;
+    // (65536: LeanGroundPS, the satellite photograph without the procedural detail; 131072: its cheap lighting, LeanLight), and the
+    // terrain's own pipeline (Renderer::SetLeanGround, Metal). Phones: 0.75 scale; desktops: full.
+    struct Quality { float scale = 1.0f; int tier = 0; int bits = 65536 | 131072; bool pipe = true; } quality;
     struct Bench {
         bool on = false, done = false;
         int step = -1;                // -1 warming up
@@ -109,13 +110,13 @@ void Game::Resize(int width, int height) { m_->w = std::max(1, width); m_->h = s
 // The benchmark's settings: render scale, physical sky (the cloud passes), FLY_FEATURES bits (65536 LeanGroundPS), the sun's shadow
 // map, the post tier. The first is the original look (the full ground shader, tier 1); then each saving added in turn.
 static const Game::Impl::BenchCase kBench[] = {
-    {"original (full detail)", 1.0f, true, 0, true, 1},
-    {"lean ground", 1.0f, true, 65536, true, 1},
-    {"+ low post, cheap clouds", 1.0f, true, 65536, true, 0},
-    {"+ 0.85 resolution", 0.85f, true, 65536, true, 0},
-    {"+ 0.75 resolution", 0.75f, true, 65536, true, 0},
-    {"+ 0.67 resolution", 0.67f, true, 65536, true, 0},
-    {"0.75, no sky (floor)", 0.75f, false, 65536, true, 0},
+    {"original (full detail)", 1.0f, true, 0, true, 1, false},
+    {"last build (lean, 0.75)", 0.75f, true, 65536, true, 0, false},
+    {"+ cheap ground light", 0.75f, true, 65536 | 131072, true, 0, false},
+    {"+ own ground pipeline", 0.75f, true, 65536 | 131072, true, 0, true},
+    {"  same at 0.85", 0.85f, true, 65536 | 131072, true, 0, true},
+    {"  same at 1.0", 1.0f, true, 65536 | 131072, true, 0, true},
+    {"0.75, no sky (floor)", 0.75f, false, 65536 | 131072, true, 0, true},
 };
 static constexpr int kBenchCount = (int)(sizeof kBench / sizeof kBench[0]);
 static constexpr double kBenchWarmup = 4.0, kBenchSettle = 1.5, kBenchMeasure = 3.0;
@@ -196,7 +197,8 @@ bool Game::Start(tbd::Renderer& r, const Settings& settings) {
     g.bench.on = !settings.vr && EnvInt("FLY_BENCH", settings.touchHints ? 1 : 0) != 0;
     g.quality.scale = std::clamp(EnvFloat("FLY_RENDER_SCALE", settings.touchHints ? 0.75f : 1.0f), 0.5f, 1.0f);
     g.quality.tier = std::clamp(EnvInt("FLY_POST_TIER", 0), 0, 4);
-    g.quality.bits = EnvInt("FLY_FEATURES", EnvInt("FLY_LEAN_GROUND", 1) ? 65536 : 0);
+    g.quality.bits = EnvInt("FLY_FEATURES", EnvInt("FLY_LEAN_GROUND", 1) ? 65536 | 131072 : 0);
+    g.quality.pipe = EnvInt("FLY_LEAN_PIPE", 1) != 0;
     r.SetRenderScale(g.quality.scale);
     tbd::Log("quality: render scale %.2f, post tier %d, features %d", g.quality.scale, g.quality.tier, g.quality.bits);
     return g.planeMesh != tbd::kInvalidMesh;
@@ -387,12 +389,15 @@ void Game::Render(tbd::Renderer& r, const EyeView* eyeView) {
     const Frustum frustum(viewProj);
     const bool cull = !g.settings.vr; // a headset's two eyes share no one viewProj here
     r.SetMaterial(tbd::kNoTexture, tbd::kNoTexture, g.sat.img.Ok() ? g.sat.img.tex : tbd::kNoTexture);
+    const int bits = bc ? bc->bits : g.quality.bits;
+    r.SetLeanGround((bc ? bc->pipe : g.quality.pipe) && (bits & 65536) != 0); // the terrain through its own pipeline (Metal)
     g.terrain.ForEach([&](const Terrain::Chunk& ch) {
         const tbd::Vec3 d{(float)(ch.origin.x - origin.x), (float)(ch.origin.y - origin.y), (float)(ch.origin.z - origin.z)};
         if (cull && !frustum.BoxVisible({d.x + ch.lo[0], d.y + ch.lo[1], d.z + ch.lo[2]}, {d.x + ch.hi[0], d.y + ch.hi[1], d.z + ch.hi[2]})) return;
         const tbd::Mat4 model = Relative(ch.origin, origin);
         r.Draw(ch.mesh, viewProj * model, model, true, true);
     });
+    r.SetLeanGround(false);
     static double coastKm = 0.0; // the sea: one big quad at sea level, only within reach of a coast
     if (g.frame % 30 == 0 || coastKm == 0.0) coastKm = g.gen->Sample(plane.pos.x, plane.pos.z).coastKm;
     if (coastKm < 150.0) {

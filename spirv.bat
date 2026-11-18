@@ -10,6 +10,7 @@ if not exist "%OUT%" mkdir "%OUT%"
 "%VULKAN_SDK%\Bin\dxc.exe" -spirv -fspv-target-env=vulkan1.3 -T vs_6_0 -E VSMain -DVULKAN -I "%SRC%" -Fo "%OUT%\mesh_vs.spv" "%SRC%\mesh.hlsl" || exit /b 1
 "%VULKAN_SDK%\Bin\dxc.exe" -spirv -fspv-target-env=vulkan1.3 -T ps_6_0 -E PSMain -DVULKAN -I "%SRC%" -Fo "%OUT%\mesh_ps.spv" "%SRC%\mesh.hlsl" || exit /b 1
 "%VULKAN_SDK%\Bin\dxc.exe" -spirv -fspv-target-env=vulkan1.3 -T ps_6_0 -E PSOverlay -DVULKAN -I "%SRC%" -Fo "%OUT%\mesh_overlay_ps.spv" "%SRC%\mesh.hlsl" || exit /b 1
+"%VULKAN_SDK%\Bin\dxc.exe" -spirv -fspv-target-env=vulkan1.3 -T ps_6_0 -E PSLeanGround -DVULKAN -I "%SRC%" -Fo "%OUT%\mesh_lean_ps.spv" "%SRC%\mesh.hlsl" || exit /b 1
 "%VULKAN_SDK%\Bin\dxc.exe" -spirv -fspv-target-env=vulkan1.3 -T vs_6_0 -E FullscreenVS -DVULKAN -I "%SRC%" -Fo "%OUT%\post_vs.spv" "%SRC%\post.hlsl" || exit /b 1
 "%VULKAN_SDK%\Bin\dxc.exe" -spirv -fspv-target-env=vulkan1.3 -T ps_6_0 -E AoPS -DVULKAN -I "%SRC%" -Fo "%OUT%\post_ao_ps.spv" "%SRC%\post.hlsl" || exit /b 1
 "%VULKAN_SDK%\Bin\dxc.exe" -spirv -fspv-target-env=vulkan1.3 -T ps_6_0 -E CloudsPS -DVULKAN -I "%SRC%" -Fo "%OUT%\post_clouds_ps.spv" "%SRC%\post.hlsl" || exit /b 1

@@ -19,7 +19,7 @@ New-Item -ItemType Directory -Force $OutDir | Out-Null
 
 # stem, SPIR-V entry, stage. Mirrors spirv.bat; post_ao_rt_ps (ray query AO) is skipped: Metal uses the non-RT AoPS.
 $shaders = @(
-    'mesh_vs VSMain vert', 'mesh_ps PSMain frag', 'mesh_overlay_ps PSOverlay frag',
+    'mesh_vs VSMain vert', 'mesh_ps PSMain frag', 'mesh_overlay_ps PSOverlay frag', 'mesh_lean_ps PSLeanGround frag',
     'post_vs FullscreenVS vert', 'post_ao_ps AoPS frag', 'post_clouds_ps CloudsPS frag', 'post_composite_ps CompositePS frag',
     'post_taa_ps TaaPS frag', 'post_tonemap_ps TonemapPS frag', 'post_cloudshadow_ps CloudShadowPS frag',
     'post_cloudresolve_ps CloudResolvePS frag', 'post_probetrace_ps ProbeTracePS frag', 'post_probeblend_ps ProbeBlendPS frag',

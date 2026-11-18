@@ -324,6 +324,7 @@ public:
         extraOf_[surface] = extra;
     }
 
+    void SetLeanGround(bool on) override { leanGround_ = on; }
     void SetMaterial(TextureId albedo, TextureId normal, TextureId surface) override {
         if (!frameActive_) return;
         curMat_[0] = albedo;
@@ -1116,6 +1117,9 @@ private:
         const MTL::ColorWriteMask all = MTL::ColorWriteMaskAll, none = MTL::ColorWriteMaskNone;
         // The HDR scene: colour plus the velocity target, which only the motion pipelines write.
         scenePipe_ = Pipe("mesh_vs", "mesh_ps", VL::Mesh, {kHdrFormat, kVelocityFormat}, kDepthFormat, Blend::None, {all, none});
+        // the basic build's terrain (SetLeanGround); optional: without it the terrain draws through scenePipe_ (PSMain branches to the same)
+        leanPipe_ = Pipe("mesh_vs", "mesh_lean_ps", VL::Mesh, {kHdrFormat, kVelocityFormat}, kDepthFormat, Blend::None, {all, none});
+        Log("Metal: lean ground pipeline %s", leanPipe_ ? "ready" : "missing (terrain uses the full shader)");
         overlayPipe_ = Pipe("mesh_vs", "mesh_overlay_ps", VL::Mesh, {kDrawableFormat}, kDepthFormat);
         instancedPipe_ = Pipe("mesh_inst_vs", "mesh_ps", VL::Instanced, {kHdrFormat, kVelocityFormat}, kDepthFormat, Blend::None, {all, none});
         // The depth pre-pass: the same vertex functions, so depth matches to the bit; no fragment function. Its shading half is
@@ -1434,7 +1438,8 @@ private:
                 bool indexed = false, NS::UInteger indexOffset = 0) {
         const bool lit = topology == Topology::Triangles && depthTest;
         if (!resolved_ && prepass_ == 1 && lit) UsePipe(prepassDepthPipe_[0], -1, dsScene_);
-        else UsePipe(resolved_ ? overlayPipe_ : scenePipe_, 0, !depthTest ? dsOff_ : (!resolved_ && prepass_ == 2 && lit) ? dsEqual_ : dsScene_);
+        else UsePipe(resolved_ ? overlayPipe_ : (leanGround_ && leanPipe_ && lit) ? leanPipe_ : scenePipe_, 0,
+                     !depthTest ? dsOff_ : (!resolved_ && prepass_ == 2 && lit) ? dsEqual_ : dsScene_);
         PushMesh(mvp, model);
         rce_->setVertexBuffer(buffer, offset, slot::kStream0);
         const MTL::PrimitiveType prim = topology == Topology::Lines ? MTL::PrimitiveTypeLine : MTL::PrimitiveTypeTriangle;
@@ -1863,6 +1868,8 @@ private:
 
     MTL::DepthStencilState *dsScene_ = nullptr, *dsEqual_ = nullptr, *dsWater_ = nullptr, *dsOff_ = nullptr, *dsShadow_ = nullptr;
     MTL::SamplerState *clampSampler_ = nullptr, *wrapSampler_ = nullptr, *shadowSampler_ = nullptr, *materialSampler_ = nullptr, *storeSampler_ = nullptr;
+    MTL::RenderPipelineState* leanPipe_ = nullptr; // mesh_lean_ps (SetLeanGround)
+    bool leanGround_ = false;
     MTL::RenderPipelineState *scenePipe_ = nullptr, *overlayPipe_ = nullptr, *instancedPipe_ = nullptr, *prepassDepthPipe_[2] = {};
     MTL::RenderPipelineState *vegPipe_ = nullptr, *vegDepthPipe_ = nullptr, *vegShadePipe_ = nullptr, *skinnedPipe_ = nullptr;
     MTL::RenderPipelineState *shadowPipe_ = nullptr, *shadowInstPipe_ = nullptr, *vegShadowPipe_ = nullptr, *shadowCutPipe_ = nullptr;
