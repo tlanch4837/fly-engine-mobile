@@ -495,6 +495,11 @@ public:
 
     // ------------------------------------------------------------------ frame
     void BeginFrame(const float clearColor[4]) override {
+        // the last finished frame's whole GPU time in the first pass slot (the per-pass split needs counter sample buffers, not
+        // done yet): a HUD that sums GpuPasses() shows the real time, not 0. Apple GPUs overlap frames, so this can exceed the
+        // frame interval; the interval is what limits the frame rate.
+        for (double& pass : gpuPasses_) pass = 0.0;
+        gpuPasses_[0] = lastGpuMs_.load();
         prepass_ = 0;
         lastCounts_ = counts_;
         counts_ = {};
@@ -847,7 +852,7 @@ public:
         // An explicit std::function: a bare lambda is ambiguous between metal-cpp's block and std::function overloads.
         const MTL::HandlerFunction onDone = [this, serial](MTL::CommandBuffer* cb) {
             const double ms = (cb->GPUEndTime() - cb->GPUStartTime()) * 1000.0;
-            if (ms > 0.0 && ms < 1000.0) { gpuMicros_ += (uint64_t)(ms * 1000.0); ++gpuSamples_; }
+            if (ms > 0.0 && ms < 1000.0) { gpuMicros_ += (uint64_t)(ms * 1000.0); ++gpuSamples_; lastGpuMs_.store(ms); }
             uint64_t done = completedSerial_.load();
             while (done < serial && !completedSerial_.compare_exchange_weak(done, serial)) {}
             dispatch_semaphore_signal(inflight_);
@@ -1710,8 +1715,6 @@ private:
         timerFrames_ = 0;
         const uint64_t samples = gpuSamples_.exchange(0), micros = gpuMicros_.exchange(0);
         if (samples) Log("Metal: GPU frame %.2f ms at %ux%u (render %ux%u, %llu-frame mean)", (double)micros / 1000.0 / (double)samples, w_, h_, sceneW_, sceneH_, (unsigned long long)samples);
-        // the whole frame's mean in the first pass slot, so a HUD that sums GpuPasses() shows the real GPU time (not 0)
-        if (samples) { for (double& p : gpuPasses_) p = 0.0; gpuPasses_[0] = (double)micros / 1000.0 / (double)samples; }
         LogCounts("Metal");
     }
 
@@ -1845,6 +1848,7 @@ private:
     uint64_t frameSerial_ = 0;
     std::atomic<uint64_t> completedSerial_{0};
     std::atomic<uint64_t> gpuMicros_{0}, gpuSamples_{0};
+    std::atomic<double> lastGpuMs_{0.0}; // the last completed command buffer's GPU time (BeginFrame -> gpuPasses_[0])
     uint32_t timerFrames_ = 0;
 
     uint32_t w_ = 1, h_ = 1, sceneW_ = 1, sceneH_ = 1;

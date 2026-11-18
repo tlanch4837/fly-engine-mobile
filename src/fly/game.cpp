@@ -52,6 +52,7 @@ static std::string EnvStr(const char* name) {
 }
 static double Seconds(int64_t ticks) { return (double)ticks / (double)tbd::platform::TickFrequency(); }
 
+
 struct Game::Impl {
     Settings settings;
     Terrain terrain;
@@ -77,6 +78,18 @@ struct Game::Impl {
     bool loading = true;
     int64_t loadStart = 0;
     struct Perf { int64_t last = 0; double cpuMs = 0, gpuMs = 0; } perf;
+    // The on-device benchmark (FLY_BENCH=1; on by default on touch devices, FLY_BENCH=0 off): after a warm-up the aircraft is
+    // frozen and each setting below runs for a few seconds; the frame interval and the GPU time of each are shown in a table.
+    struct BenchCase { const char* name; float scale; bool sky; int bits; bool shadows; };
+    struct Bench {
+        bool on = false, done = false;
+        int step = -1;                // -1 warming up
+        double t = 0;                 // seconds into this step
+        double frameSum = 0, gpuSum = 0;
+        int n = 0;
+        struct Row { double frameMs = 0, gpuMs = 0; };
+        std::vector<Row> rows;
+    } bench;
     // last: its threads are joined first when the game goes, before the terrain they write into
     std::unique_ptr<Workers> workers;
 };
@@ -88,6 +101,20 @@ bool Game::HandlesEscape() const { return false; }
 bool Game::WantsFullscreen() const { return false; }
 bool Game::WantsMouseLook() const { return false; }
 void Game::Resize(int width, int height) { m_->w = std::max(1, width); m_->h = std::max(1, height); }
+
+// The benchmark's settings: render scale, physical sky (the cloud passes), FLY_FEATURES bits (lighting.hlsli FEATURE_OFF:
+// 2 one-tap shadows instead of PCSS, 256 the ground unlit: no procedural detail, shadows or probes), and the sun's shadow map.
+static const Game::Impl::BenchCase kBench[] = {
+    {"full", 1.0f, true, 0, true},
+    {"half resolution", 0.5f, true, 0, true},
+    {"no clouds / sky", 1.0f, false, 0, true},
+    {"simple ground shading", 1.0f, true, 256, true},
+    {"no shadows", 1.0f, true, 0, false},
+    {"one-tap shadows", 1.0f, true, 2, true},
+    {"all cheap", 0.5f, false, 256, false},
+};
+static constexpr int kBenchCount = (int)(sizeof kBench / sizeof kBench[0]);
+static constexpr double kBenchWarmup = 4.0, kBenchSettle = 1.5, kBenchMeasure = 3.0;
 
 // The aircraft on the chosen runway end: on final 6 km out on a 3 degree glide (FLY_SPAWN=approach), or on the threshold, stopped.
 static void PlaceAircraft(Game::Impl& g) {
@@ -162,6 +189,7 @@ bool Game::Start(tbd::Renderer& r, const Settings& settings) {
     if (g.sat.enabled) g.sat.Start(tbd::platform::CacheRoot() / "satcache");
     PlaceAircraft(g);
     g.loadStart = tbd::platform::Ticks();
+    g.bench.on = !settings.vr && EnvInt("FLY_BENCH", settings.touchHints ? 1 : 0) != 0;
     return g.planeMesh != tbd::kInvalidMesh;
 }
 
@@ -177,6 +205,7 @@ void Game::Simulate(float dt, const Input& in) {
     g.simTime += dt;
     ++g.frame;
     if (g.loading) return;
+    if (g.bench.on && !g.bench.done) return; // the benchmark: the same view for every setting
     auto ease = [&](float& v, float target) { v += (target - v) * std::min(1.0f, dt * 6.0f); };
     ease(g.ctl.pitch, std::clamp(in.pitch, -1.0f, 1.0f));
     ease(g.ctl.roll, std::clamp(in.roll, -1.0f, 1.0f));
@@ -286,7 +315,29 @@ void Game::Render(tbd::Renderer& r, const EyeView* eyeView) {
     const tbd::Mat4 viewProj = proj * view;
 
     tbd::FrameView fv;
-    fv.viewProj = viewProj; fv.invJittered = tbd::Inverse(viewProj); fv.eye = eye; fv.time = (float)g.simTime; fv.sky = true;
+    const Game::Impl::BenchCase* bc = nullptr;
+    if (g.bench.on && !g.bench.done) { // step the benchmark: warm up, then each case settles and is measured
+        Game::Impl::Bench& b = g.bench;
+        b.t += g.lastDt;
+        const double gpu = r.GpuPasses()[0] + r.GpuPasses()[1] + r.GpuPasses()[2] + r.GpuPasses()[3] + r.GpuPasses()[4] + r.GpuPasses()[5] +
+                           r.GpuPasses()[6] + r.GpuPasses()[7] + r.GpuPasses()[8] + r.GpuPasses()[9];
+        if (b.step < 0) {
+            if (b.t >= kBenchWarmup) { b.step = 0; b.t = 0; r.SetRenderScale(kBench[0].scale); }
+        } else {
+            if (b.t > kBenchSettle) { b.frameSum += g.lastDt * 1000.0; b.gpuSum += gpu; ++b.n; }
+            if (b.t >= kBenchSettle + kBenchMeasure) {
+                Game::Impl::Bench::Row row;
+                row.frameMs = b.n ? b.frameSum / b.n : 0; row.gpuMs = b.n ? b.gpuSum / b.n : 0;
+                b.rows.push_back(row);
+                tbd::Log("bench: %-22s %5.1f fps  frame %5.1f ms  gpu %5.1f ms", kBench[b.step].name, 1000.0 / std::max(0.1, row.frameMs), row.frameMs, row.gpuMs);
+                b.frameSum = b.gpuSum = 0; b.n = 0; b.t = 0;
+                if (++b.step >= kBenchCount) { b.done = true; r.SetRenderScale(1.0f); }
+                else r.SetRenderScale(kBench[b.step].scale);
+            }
+        }
+        if (!b.done && b.step >= 0) bc = &kBench[b.step];
+    }
+    fv.viewProj = viewProj; fv.invJittered = tbd::Inverse(viewProj); fv.eye = eye; fv.time = (float)g.simTime; fv.sky = bc ? bc->sky : true;
     fv.postTier = std::clamp(EnvInt("FLY_POST_TIER", 1), 0, 4); fv.dt = g.lastDt; fv.motionVectors = false;
     { // the air: aerial perspective and height fog; clear, haze, fog (F)
         static const float kAir[3][3] = {{1.0f, 0.8e-5f, 1500.0f}, {1.6f, 2.0e-5f, 1200.0f}, {3.0f, 3.0e-4f, 260.0f}};
@@ -301,7 +352,8 @@ void Game::Render(tbd::Renderer& r, const EyeView* eyeView) {
     tbd::Lighting light = tbd::ComputeLighting(g.sun);
     light.eye[0] = eye.x; light.eye[1] = eye.y; light.eye[2] = eye.z;
     // the only shadow: the aircraft's own, in a small sun map round it (it lands on the runway on approach and on the ground)
-    const bool shadows = tbd::ComputeShadow(g.sun, p, 40.0f, light);
+    const bool shadows = (!bc || bc->shadows) && tbd::ComputeShadow(g.sun, p, 40.0f, light);
+    light.lightDebug[2] = (float)(bc ? bc->bits : EnvInt("FLY_FEATURES", 0));
     tbd::ComputeCloudMap(eye, false, light);
     r.SetWindowPortals(nullptr, 0);
     r.SetInteriorRooms(nullptr, 0);
@@ -389,6 +441,25 @@ void Game::Render(tbd::Renderer& r, const EyeView* eyeView) {
     hud.Text(m, g.h - m, 12 * S, g.settings.touchHints ? "Sticks fly  |  slider throttle" : "Arrows / WASD fly  |  +/- throttle  |  C camera  |  R reset  |  F fog",
              Rgba(220, 225, 235, 190));
     hud.TextCentered(g.w * 0.5f, g.h - m, 11 * S, g.sat.Credit(), Rgba(220, 225, 235, 140));
+    if (g.bench.on) { // the benchmark's table, top right: each setting's frame rate, frame interval and GPU time
+        const Game::Impl::Bench& bn = g.bench;
+        const float tw = 470 * S, x0 = g.w - m - tw, row = 24 * S;
+        hud.Glass(x0, m, x0 + tw, m + row * (kBenchCount + 2.4f), 10 * S);
+        char t[128];
+        if (bn.step < 0) std::snprintf(t, sizeof t, "BENCHMARK  starts in %.0f s  (hold still)", std::max(0.0, kBenchWarmup - bn.t));
+        else if (!bn.done) std::snprintf(t, sizeof t, "BENCHMARK  %d / %d  running...", bn.step + 1, kBenchCount);
+        else std::snprintf(t, sizeof t, "BENCHMARK  done  (fps / frame / gpu)");
+        hud.Text(x0 + 14 * S, m + row, 15 * S, t, Rgba(255, 220, 150), FontFace::Bold);
+        for (int k = 0; k < kBenchCount; ++k) {
+            const float y = m + row * (k + 2.1f);
+            const bool cur = !bn.done && k == bn.step;
+            hud.Text(x0 + 14 * S, y, 14 * S, kBench[k].name, cur ? Rgba(255, 220, 150) : Rgba(230, 232, 240));
+            if (k < (int)bn.rows.size()) {
+                std::snprintf(t, sizeof t, "%3.0f fps  %5.1f ms  %5.1f ms", 1000.0 / std::max(0.1, bn.rows[(size_t)k].frameMs), bn.rows[(size_t)k].frameMs, bn.rows[(size_t)k].gpuMs);
+                hud.Text(x0 + 230 * S, y, 14 * S, t, Rgba(170, 230, 170));
+            }
+        }
+    }
     hud.End(r, g.w, g.h, false);
 }
 
