@@ -1248,7 +1248,7 @@ public:
         }
         Mark(4);
         if (rayTraced) list_->SetGraphicsRootShaderResourceView(2, rayFrames_[frameSlot_].tlas->GetGPUVirtualAddress());
-        if (!(view_.cityAir && view_.postTier == 0)) // Low: the city composite reads no occlusion
+        if (view_.postTier > 0) // Low: the composite reads no occlusion (post.hlsl CompositePS)
             PostPass(kAo, rayTraced ? aoRtPso_.Get() : postPso_[0].Get(), std::max(1u, rw_ / 2), std::max(1u, rh_ / 2));
         Mark(5);
         if (view_.sky) {

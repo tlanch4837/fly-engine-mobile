@@ -795,7 +795,7 @@ public:
             PostPass(kProbes, 6, kProbeX * 3, kProbeAtlasH, cur);
             ++probeAge_;
         }
-        PostPass(kAo, 0, std::max(1u, w / 2), std::max(1u, h / 2), cur);
+        if (view_.postTier > 0) PostPass(kAo, 0, std::max(1u, w / 2), std::max(1u, h / 2), cur); // Low: the composite reads no occlusion
         if (view_.sky) {
             PostPass(kCloudMarch, 1, std::max(1u, w / 4), std::max(1u, h / 4), cur);
             PostPass(cur ? kClouds1 : kClouds, 10, std::max(1u, w / 2), std::max(1u, h / 2), cur);
@@ -804,7 +804,7 @@ public:
         if (waterPending_) WaterPass(w, h);
         PostPass(kHistory0 + cur, 3, w, h, cur);
         PostPass(kExposure, 7, 1, 1, cur);
-        PostPass(kBloom, 8, std::max(1u, w / 4), std::max(1u, h / 4), cur);
+        if (view_.postTier > 1) PostPass(kBloom, 8, std::max(1u, w / 4), std::max(1u, h / 4), cur); // Low and Low/Med: the tone map adds no bloom
 
         drawable_ = layer_->nextDrawable(); // as late as possible: the drawable is the scarcest thing in the frame
         if (drawable_) {

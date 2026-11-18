@@ -2525,9 +2525,36 @@ float4 AtlasBuildingPS(VSOut i) {
     return float4(lit, roughness < 0.35 ? -shareAlpha : shareAlpha);
 }
 
+// The basic build's ground (FLY_FEATURES bit 65536, set by src/fly/game.cpp): the satellite photograph lit by the sun and the sky,
+// with the aircraft's shadow, the clouds' shadows and the water marks, but none of MappedGroundPS's procedural detail (fields, grass
+// tufts, pavement grain, the world atlas, creeks, seasons, noise bumps), which the photograph covers anyway. It runs ahead of
+// PSMain's PCSS and baked-city shadow and its material switch. On an iPhone 17 Pro that detail was 33 of 55 GPU ms a frame.
+float4 LeanGroundPS(VSOut i) {
+    float3 a = pow(saturate(i.color.rgb), 2.2);
+    float w;
+    const float3 img = GroundImagery(i.worldPos, length(gLight.eye.xyz - i.worldPos), w);
+    if (w > 0.0) a = lerp(a, img, w);
+    float rough = 0.9;
+    gSpecular = 0.12; // grass, soil, fields: matte
+    // open water on the terrain (vertex alpha 0.06, blending to the land's 0.08 across a bank): dark, smooth, the sky in it at a slant
+    const float water = i.color.a < 0.05 ? 0.0 : saturate((0.08 - i.color.a) / 0.02);
+    if (water > 0.0) {
+        a = lerp(a, float3(0.018, 0.03, 0.032), water);
+        rough = lerp(rough, 0.2, water);
+        gSpecular = lerp(gSpecular, 0.8, water);
+    }
+    gTightSoft = 1.0;
+    gPixelShadow = ShadowFactor(i.shadowPos, i.tightPos);
+    const float cs = CloudSun(i.worldPos);
+    float share;
+    const float3 lit = LitPbr(a, normalize(i.normal), i.worldPos, gPixelShadow * cs, rough, 0.0, cs, share);
+    return float4(lit, 0.76 + 0.23 * share);
+}
+
 float4 PSMain(VSOut i) : SV_Target {
     if (FadeHides(i.pos.xy, MATERIAL_CONSTANTS.w)) discard;
     gShadowPixel = i.pos.xy;
+    if (FEATURE_OFF(65536) && i.color.a > 0.015 && i.color.a < 0.12) return LeanGroundPS(i); // the basic build's ground
     if (FEATURE_OFF(256)) { // Graphics > Quality: Unlit (and TBD_FEATURECOST): the texture under a fixed half-Lambert key, no shadows or probes
         const bool atlasUnlit = IsAtlasBuilding(i.color.a);
         float4 tex = atlasUnlit ? float4(kWorldTexMean[(int)clamp(floor((i.color.a - 3.0) * 64.0), 0.0, 63.0)], 1.0) : gAlbedo.Sample(gTexSampler, i.uv);

@@ -484,11 +484,13 @@ float4 CloudsPS(FsOut i) : SV_Target {
         float3 sun = SunLight(o + d * t0);
         // Adaptive steps: longer with distance, and the cheap density alone through empty air (Schneider 2015). Doubling the step there left holes in thin clouds.
         sCloudDetail = saturate(1.3 - t0 / 18000.0);
-        float dt = (t1 - t0) / (shell == 0 ? 36.0 : 5.0);
+        // the Low tier (phones): about half the steps through the cumulus, each longer (thin edges go a little softer)
+        bool lowTier = motion.w > 0.5 && motion.w < 1.5; // PostTier() == 0 (defined further down)
+        float dt = (t1 - t0) / (shell == 0 ? (lowTier ? 20.0 : 36.0) : 5.0);
         dt *= lerp(1.0, 1.6, saturate(t0 / 30000.0));
         float t = t0 + dt * jitter;
         int empty = 8;
-        int maxSteps = shell == 0 ? 56 : 7;
+        int maxSteps = shell == 0 ? (lowTier ? 30 : 56) : 7;
         for (int k = 0; k < maxSteps && t < t1 && T > 0.01; ++k) {
             float3 p = o + d * t;
             if (empty >= 4) {
@@ -795,7 +797,7 @@ float4 CompositePS(FsOut i) : SV_Target {
     float depth = gDepth.SampleLevel(gClamp, i.uv, 0);
     if (lightDebug.x > 5.5 && lightDebug.x < 7.5) return float4(gCloudShadow.SampleLevel(gClamp, i.uv, 0).rrr, 1); // the whole cloud shadow map (north up is -z), 30 km across
     if (CityLook()) return float4(min(CityComposite(c, gScene.SampleLevel(gClamp, i.uv, 0).a, i.uv, i.pos.xy, depth), 2000.0), 1);
-    if (misc.z < 0.5) return float4(c * (depth > 0.0 ? AoUpsample(i.pos.xy, depth) : 1.0), 1);
+    if (misc.z < 0.5) return float4(c * (depth > 0.0 && PostTier() > 0 ? AoUpsample(i.pos.xy, depth) : 1.0), 1);
     float3 world = WorldAt(i.uv, max(depth, 1e-5));
     float3 d = normalize(world - eye.xyz);
     float3 trans;
@@ -837,7 +839,7 @@ float4 CompositePS(FsOut i) : SV_Target {
             c = ScreenReflection(i.uv, i.pos.xy, world, d, sn, dist, c);
         }
         if (sa < 0.75) c = ScatterSkin(i.uv, i.pos.xy, c, world, dist);
-        float ao = AoUpsample(i.pos.xy, depth);
+        float ao = PostTier() > 0 ? AoUpsample(i.pos.xy, depth) : 1.0; // Low runs no AO pass: its texture holds nothing
         // Not on skin: marching a face's faceted depth tears hard patches into it, and the tight shadow map is sharp enough there.
         float contact = sa < 0.75 ? 1.0 : 1.0 - 0.8 * ContactShadow(i.uv, i.pos.xy, world, dist);
         if (sa > 0.995) c *= ao * contact; // eyes

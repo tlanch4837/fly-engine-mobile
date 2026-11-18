@@ -7,7 +7,8 @@
 //
 // Env: FLY_AIRPORT=KDTW (an ICAO code from data/airports; default the first), FLY_RUNWAY=22R (the end to use; default the first),
 // FLY_SPAWN=approach|runway (default approach: 6 km out on a 3 degree glide), FLY_SAT=0 (no imagery), FLY_SAT_NEAR_ZOOM (14),
-// FLY_HOUR (15.6), FLY_FOG (0 clear, 1 haze, 2 fog), FLY_HUD=0, FLY_CLOUDS (0..1), FLY_POST_TIER (0..4, default 1).
+// FLY_HOUR (15.6), FLY_FOG (0 clear, 1 haze, 2 fog), FLY_HUD=0, FLY_CLOUDS (0..1), FLY_POST_TIER (0..4, default 0),
+// FLY_RENDER_SCALE (0.5..1; phones 0.75), FLY_LEAN_GROUND=0 (the full procedural ground shader), FLY_FEATURES (exact bits), FLY_BENCH.
 #include "game.h"
 
 #include <algorithm>
@@ -80,7 +81,10 @@ struct Game::Impl {
     struct Perf { int64_t last = 0; double cpuMs = 0, gpuMs = 0; } perf;
     // The on-device benchmark (FLY_BENCH=1; on by default on touch devices, FLY_BENCH=0 off): after a warm-up the aircraft is
     // frozen and each setting below runs for a few seconds; the frame interval and the GPU time of each are shown in a table.
-    struct BenchCase { const char* name; float scale; bool sky; int bits; bool shadows; };
+    struct BenchCase { const char* name; float scale; bool sky; int bits; bool shadows; int tier; };
+    // The quality the game runs at (Start): render scale, post tier (0 Low: no AO, no bloom, cheaper clouds), FLY_FEATURES bits
+    // (65536: LeanGroundPS, the satellite photograph without the procedural detail). Phones: 0.75 scale; desktops: full.
+    struct Quality { float scale = 1.0f; int tier = 0; int bits = 65536; } quality;
     struct Bench {
         bool on = false, done = false;
         int step = -1;                // -1 warming up
@@ -102,16 +106,16 @@ bool Game::WantsFullscreen() const { return false; }
 bool Game::WantsMouseLook() const { return false; }
 void Game::Resize(int width, int height) { m_->w = std::max(1, width); m_->h = std::max(1, height); }
 
-// The benchmark's settings: render scale, physical sky (the cloud passes), FLY_FEATURES bits (lighting.hlsli FEATURE_OFF:
-// 2 one-tap shadows instead of PCSS, 256 the ground unlit: no procedural detail, shadows or probes), and the sun's shadow map.
+// The benchmark's settings: render scale, physical sky (the cloud passes), FLY_FEATURES bits (65536 LeanGroundPS), the sun's shadow
+// map, the post tier. The first is the original look (the full ground shader, tier 1); then each saving added in turn.
 static const Game::Impl::BenchCase kBench[] = {
-    {"full", 1.0f, true, 0, true},
-    {"half resolution", 0.5f, true, 0, true},
-    {"no clouds / sky", 1.0f, false, 0, true},
-    {"simple ground shading", 1.0f, true, 256, true},
-    {"no shadows", 1.0f, true, 0, false},
-    {"one-tap shadows", 1.0f, true, 2, true},
-    {"all cheap", 0.5f, false, 256, false},
+    {"original (full detail)", 1.0f, true, 0, true, 1},
+    {"lean ground", 1.0f, true, 65536, true, 1},
+    {"+ low post, cheap clouds", 1.0f, true, 65536, true, 0},
+    {"+ 0.85 resolution", 0.85f, true, 65536, true, 0},
+    {"+ 0.75 resolution", 0.75f, true, 65536, true, 0},
+    {"+ 0.67 resolution", 0.67f, true, 65536, true, 0},
+    {"0.75, no sky (floor)", 0.75f, false, 65536, true, 0},
 };
 static constexpr int kBenchCount = (int)(sizeof kBench / sizeof kBench[0]);
 static constexpr double kBenchWarmup = 4.0, kBenchSettle = 1.5, kBenchMeasure = 3.0;
@@ -190,6 +194,11 @@ bool Game::Start(tbd::Renderer& r, const Settings& settings) {
     PlaceAircraft(g);
     g.loadStart = tbd::platform::Ticks();
     g.bench.on = !settings.vr && EnvInt("FLY_BENCH", settings.touchHints ? 1 : 0) != 0;
+    g.quality.scale = std::clamp(EnvFloat("FLY_RENDER_SCALE", settings.touchHints ? 0.75f : 1.0f), 0.5f, 1.0f);
+    g.quality.tier = std::clamp(EnvInt("FLY_POST_TIER", 0), 0, 4);
+    g.quality.bits = EnvInt("FLY_FEATURES", EnvInt("FLY_LEAN_GROUND", 1) ? 65536 : 0);
+    r.SetRenderScale(g.quality.scale);
+    tbd::Log("quality: render scale %.2f, post tier %d, features %d", g.quality.scale, g.quality.tier, g.quality.bits);
     return g.planeMesh != tbd::kInvalidMesh;
 }
 
@@ -331,14 +340,14 @@ void Game::Render(tbd::Renderer& r, const EyeView* eyeView) {
                 b.rows.push_back(row);
                 tbd::Log("bench: %-22s %5.1f fps  frame %5.1f ms  gpu %5.1f ms", kBench[b.step].name, 1000.0 / std::max(0.1, row.frameMs), row.frameMs, row.gpuMs);
                 b.frameSum = b.gpuSum = 0; b.n = 0; b.t = 0;
-                if (++b.step >= kBenchCount) { b.done = true; r.SetRenderScale(1.0f); }
+                if (++b.step >= kBenchCount) { b.done = true; r.SetRenderScale(g.quality.scale); }
                 else r.SetRenderScale(kBench[b.step].scale);
             }
         }
         if (!b.done && b.step >= 0) bc = &kBench[b.step];
     }
     fv.viewProj = viewProj; fv.invJittered = tbd::Inverse(viewProj); fv.eye = eye; fv.time = (float)g.simTime; fv.sky = bc ? bc->sky : true;
-    fv.postTier = std::clamp(EnvInt("FLY_POST_TIER", 1), 0, 4); fv.dt = g.lastDt; fv.motionVectors = false;
+    fv.postTier = bc ? bc->tier : g.quality.tier; fv.dt = g.lastDt; fv.motionVectors = false;
     { // the air: aerial perspective and height fog; clear, haze, fog (F)
         static const float kAir[3][3] = {{1.0f, 0.8e-5f, 1500.0f}, {1.6f, 2.0e-5f, 1200.0f}, {3.0f, 3.0e-4f, 260.0f}};
         static const float kTint[3][4] = {{0.55f, 0.70f, 0.96f, 0.40f}, {0.64f, 0.74f, 0.90f, 0.22f}, {0.76f, 0.79f, 0.84f, 0.65f}};
@@ -353,7 +362,7 @@ void Game::Render(tbd::Renderer& r, const EyeView* eyeView) {
     light.eye[0] = eye.x; light.eye[1] = eye.y; light.eye[2] = eye.z;
     // the only shadow: the aircraft's own, in a small sun map round it (it lands on the runway on approach and on the ground)
     const bool shadows = (!bc || bc->shadows) && tbd::ComputeShadow(g.sun, p, 40.0f, light);
-    light.lightDebug[2] = (float)(bc ? bc->bits : EnvInt("FLY_FEATURES", 0));
+    light.lightDebug[2] = (float)(bc ? bc->bits : g.quality.bits);
     tbd::ComputeCloudMap(eye, false, light);
     r.SetWindowPortals(nullptr, 0);
     r.SetInteriorRooms(nullptr, 0);
